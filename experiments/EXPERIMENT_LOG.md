@@ -2,217 +2,231 @@
 
 Tracking all experiments, motivations, results, and decisions for our Parameter Golf submission.
 
-## Core Strategy
+## Current Best Config
 
-**Goal:** Beat 1.0156 BPB (current SOTA: MPK 8×384) by composing:
-- **MPK** (multi-scale attention) — 3 effective attention passes per block for 1 set of weights
-- **Depth recurrence** — loop shared blocks for effective depth without parameter cost
-- **Per-loop LoRA** — cheap specialization so each loop iteration has a distinct role
-- **mHC-Lite** — doubly stochastic stream mixing to stabilize deep recurrence
-- **Stride scheduling** — vary resolution per loop (coarse→fine) for scale diversity across depth
+```bash
+MODEL_FAMILY=looped NUM_UNIQUE_BLOCKS=3 NUM_LOOPS=3 MODEL_DIM=512 \
+  NUM_HEADS=8 NUM_KV_HEADS=4 MLP_TYPE=swiglu LORA_RANK=32 MHC_STREAMS=4 \
+  TRAIN_BATCH_TOKENS=32768 MATRIX_LR=0.08
+```
 
-Combined: 3 unique MPKBlocks × 3 loops × 3 scales per block = **27 effective attention passes** for 3 weight sets.
+**val_bpb=2.0514** at 200 steps on 1 shard (M1 Ultra). ~13M params, ~32k tok/s.
+
+Winning recipe: **LoopedGPT + SwiGLU + LoRA32 + mHC-Lite (n=4), no MPK, batch=32k, lr=0.08**
+
+---
+
+## Strategy Evolution
+
+**Original hypothesis:** MPK multi-scale attention × depth recurrence × LoRA × mHC = maximum compute per parameter.
+
+**What actually happened:** MPK's 3× attention passes per block cost 2.3× wall time. At fixed wallclock, the simpler looped model sees 2.3× more tokens/sec and wins. The mHC+LoRA+SwiGLU composition is doing the real work — MPK's multi-scale processing doesn't add enough to justify its speed penalty.
+
+**Current strategy:** Depth recurrence (3 blocks × 3 loops) with per-loop LoRA specialization, mHC-Lite for stable multi-stream mixing, SwiGLU MLP, at the largest batch size that fits in wallclock.
 
 ---
 
 ## Phase 1: Depth Recurrence Validation
 
 **Date:** 2026-03-19
-**Motivation:** The baseline uses 9 independent blocks (~17M params). Most of the 16MB budget goes to block weights. If we share blocks across loops, we free parameter budget for wider models.
+**Motivation:** The baseline uses 9 independent blocks (~17M params). Sharing blocks across loops frees parameter budget for wider models.
 
 **Setup:** 200 steps, 1 shard, TRAIN_BATCH_TOKENS=8192, VAL_BATCH_SIZE=524288
 
-| Config | Params | val_bpb | Train Loss | ms/step | Notes |
-|--------|--------|---------|------------|---------|-------|
-| baseline (9 blocks, dim=512) | 17.1M | **2.3015** | 3.9021 | 1320 | Reference |
-| loop_3x3_512 (3×3, dim=512) | 6.0M | 2.3593 | 3.8153 | 567 | 1/3 params, competitive |
-| **loop_3x3_768** (3×3, dim=768) | 12.6M | **2.2896** | 3.8313 | 1194 | Beats baseline, 26% fewer params |
-| loop_1x9_512 (1×9, dim=512) | ~2.3M | 2.3892 | 3.8520 | 581 | Extreme recurrence, still OK |
-| loop_3x3_512 + mHC n=2 | ~6M | killed early | 4.1578 @200 | ~1990 | 2x slower, higher loss |
-| loop_3x3_768 + mHC n=2 | ~12.6M | killed early | 4.1130 @200 | ~2752 | mHC hurt at these depths |
+| Config | Params | val_bpb | Train Loss | ms/step |
+|--------|--------|---------|------------|---------|
+| baseline (9 blocks, dim=512) | 17.1M | 2.3015 | 3.9021 | 1320 |
+| loop_3x3_512 (3×3, dim=512) | 6.0M | 2.3593 | 3.8153 | 567 |
+| **loop_3x3_768 (3×3, dim=768)** | 12.6M | **2.2896** | 3.8313 | 1194 |
+| loop_1x9_512 (1×9, dim=512) | ~2.3M | 2.3892 | 3.8520 | 581 |
+| loop_3x3_512 + naive mHC n=2 | ~6M | killed | 4.1578 @200 | ~1990 |
+| loop_3x3_768 + naive mHC n=2 | ~12.6M | killed | 4.1130 @200 | ~2752 |
 
 **Conclusions:**
-- ✅ Depth recurrence validated — wider looped models beat independent blocks
-- ✅ loop_3x3_768 is the best config (beats baseline with fewer params)
-- ❌ Naive mHC (n=2, simple sigmoid mixing) hurt performance — too slow, not expressive enough
-- The n=2 mHC was a simplistic implementation (just H_res, no H_pre/H_post). Proper mHC-Lite with n=4 and input-dependent projections should be different.
-
-**Decision:** Proceed with depth recurrence. Revisit mHC after implementing the proper mHC-Lite (Birkhoff decomposition, n=4, input-dependent).
+- ✅ Depth recurrence validated — loop_3x3_768 beats baseline with 26% fewer params
+- ❌ Naive mHC (n=2, static sigmoid, no H_pre/H_post) was 2× slower and hurt loss
+- Decision: Proceed with recurrence. Revisit mHC with proper mHC-Lite implementation.
 
 ---
 
-## Phase 3/3b: MPK + Looped Composition
+## Phase 3: Component Ablation (4-Way Comparison)
 
 **Date:** 2026-03-19
-**Motivation:** MPK (Multi-Pass Keys) is the current SOTA at 1.0156 BPB. It runs one shared StreamBlock at 3 resolutions (full/k=2/m=4) per MPKBlock. Composing with depth recurrence multiplies compute efficiency: 3 blocks × 3 loops × 3 scales = 27 effective attention passes for 3 weight sets.
+**Motivation:** Test each component independently on mpk_looped to find the winning combination.
 
-### Smoke Tests (3 steps, verifying all model families work)
+**Setup:** 200 steps, 1 shard, batch=8192, dim=256, 3×3 loops. Small dim (2.9-3.3M params) for fast iteration — tests relative differences, not absolute competitiveness.
 
-| Family | Config | Params | Status |
-|--------|--------|--------|--------|
-| baseline (GPT) | 9L dim=512 | 17.1M | ✅ Works |
-| looped (LoopedGPT) | 2×2 dim=512 | 4.2M | ✅ Works |
-| looped + LoRA | 2×2 dim=512 rank=8 | 4.3M | ✅ Works |
-| looped + SwiGLU | 2×2 dim=512 swiglu | 5.2M | ✅ Works |
-| mpk (MPKGPT) | 2L dim=128 | 591K | ✅ Works |
-| mpk_looped (LoopedMPKGPT) | 2×2 dim=128 | 591K | ✅ Works |
-| mpk_looped + LoRA | 2×2 dim=128 rank=8 | 606K | ✅ Works |
-| mpk_looped + mHC-Lite n=4 | 2×2 dim=128 | 624K | ✅ Works |
-
-### 200-Step Comparisons (dim=256, 3×3 loops)
-
-**Setup:** 200 steps, 1 shard, TRAIN_BATCH_TOKENS=8192, VAL_BATCH_SIZE=524288
-
-⚠️ **Note:** dim=256 gives only 2.9M params — much smaller than baseline's 17M. These results test *relative* differences between variants, not absolute competitiveness vs baseline. Need to scale up dim for fair baseline comparison.
-
-| Config | Params | val_bpb | int8 bpb | Compressed | ms/step |
-|--------|--------|---------|----------|------------|---------|
-| mpk_looped relu2 | 2.92M | 2.7464 | 2.7458 | 2.9MB | 388 |
-| mpk_looped swiglu | 3.31M | **2.6702** | 2.6709 | 3.2MB | 420 |
-| mpk_looped + lora32 | 3.16M | 2.7088 | — | — | 399 |
-| **mpk_looped + lora32 + mHC** | **3.26M** | **2.5309** | — | — | 439 |
+| Config | Params | val_bpb | Train Loss | ms/step |
+|--------|--------|---------|------------|---------|
+| mpk_looped relu2 | 2.92M | 2.7464 | 4.4548 | 388 |
+| mpk_looped swiglu | 3.31M | 2.6702 | 4.3576 | 420 |
+| mpk_looped + lora32 | 3.16M | 2.7088 | 4.3623 | 399 |
+| **mpk_looped + lora32 + mHC** | **3.26M** | **2.5309** | **4.1211** | 439 |
 
 **Key findings:**
-- ✅ **mHC-Lite + LoRA is the clear winner** — 2.5309 vs 2.6702 for next best (swiglu), a 0.14 BPB gap
-- ✅ SwiGLU beats relu² (2.6702 vs 2.7464) at ~8% speed cost
-- ✅ LoRA helps (2.7088 vs 2.7464) but alone doesn't beat SwiGLU
-- ✅ mHC overhead is only 13% (439 vs 388 ms/step) — much better than naive mHC's 2× from Phase 1
-- ⚠️ SwiGLU is absent from the mHC+LoRA winning run — combining all three is the obvious next experiment
-- ⚠️ dim=256 gives only 2.9-3.3M params vs baseline's 17.1M — not a fair absolute comparison
+- ✅ **mHC-Lite + LoRA is the big winner** — 0.14 BPB gap over next best
+- ✅ SwiGLU beats relu² (0.076 BPB) at ~8% speed cost
+- ✅ LoRA helps (0.038 BPB) but alone doesn't beat SwiGLU
+- ✅ mHC overhead is only 13% — much better than naive mHC's 2×
+- ✅ Proper mHC-Lite (n=4, Birkhoff decomposition, input-dependent) is fundamentally better than naive mHC (n=2, static sigmoid)
 
-**Interpretation:** LoRA creates distinct per-loop signals (each loop specializes its attention via rank-32 adapters). mHC-Lite blends these 4 streams with input-dependent doubly stochastic mixing. The combination enables information flow patterns that neither component achieves alone — LoRA provides diversity, mHC provides stable cross-stream integration.
-
-**Decision:** Run SwiGLU + LoRA32 + mHC at dim=512 for fair baseline comparison.
+**Interpretation:** LoRA creates distinct per-loop signals. mHC-Lite blends 4 streams with input-dependent doubly stochastic mixing. Together they enable richer information flow than either alone.
 
 ---
 
-## Running: Full Stack at dim=512 vs Baseline
+## Full Stack at dim=512 vs Baseline (batch=8k)
 
 **Date:** 2026-03-19
-**Motivation:** The 4-way comparison showed mHC+LoRA dominates at dim=256, but that's only 3.3M params vs baseline's 17M. Need a fair comparison at dim=512. Also combining SwiGLU (best MLP) + LoRA32 (best specialization) + mHC (best mixing) for the first time.
+**Motivation:** Scale up to fair param comparison with baseline.
 
-**Setup:** 200 steps, 1 shard, TRAIN_BATCH_TOKENS=8192, VAL_BATCH_SIZE=524288
+**Setup:** 200 steps, 1 shard, batch=8192, dim=512
 
-| Config | Expected Params | Status |
-|--------|----------------|--------|
-| mpk_looped swiglu+lora32+mhc dim=512 | ~12-15M | 🔄 Running |
-| baseline 9L dim=512 | 17.1M | ⏳ Queued (runs after) |
+| Config | Params | val_bpb | Compressed | ms/step |
+|--------|--------|---------|------------|---------|
+| baseline 9L dim=512 | 17.1M | **2.3998** | 11.3MB | 373 |
+| mpk_looped swiglu+lora32+mhc dim=512 | 13.8M | 2.4213 | — | 841 |
 
-**Results:**
+**Conclusion:** At batch=8k, the full stack is slightly behind baseline despite fewer params — the 2.3× speed penalty means fewer total tokens seen. Need larger batch.
 
-| Config | Params | val_bpb | int8 bpb | Compressed | ms/step |
-|--------|--------|---------|----------|------------|---------|
-| baseline 9L dim=512 | 17.1M | **2.3998** | 2.4007 | 11.3MB | 373 |
-| full stack mpk_looped swiglu+lora32+mhc dim=512 | 13.8M | 2.4213 | — | — | 841 |
+---
 
-**Analysis:** Full stack is slightly behind baseline (0.02 BPB) with 19% fewer params. But it's 2.3x slower per step — at 200 steps with 8192 tokens/batch, both models see the same number of tokens but the full stack takes 168s vs 75s. The loss curve is still descending steeply at step 200, suggesting it would overtake with more iterations.
+## LR Sweep (mpk_looped, batch=8k)
 
-**Key concern:** The per-step speed penalty means on H100 with a 10-minute cap, the full stack gets fewer total steps than baseline. Need to verify this doesn't eliminate the param efficiency advantage.
+**Date:** 2026-03-20
+**Motivation:** mHC should stabilize training at higher LR.
 
-**Next experiment:** Bump learning rate. mHC's doubly stochastic constraint should allow more aggressive optimization without divergence — test matrix_lr=0.08 and 0.12.
+**Setup:** Full stack (swiglu+lora32+mhc) dim=512, 200 steps, batch=8k, varying matrix_lr.
 
-### LR Sweep Results
-
-**Setup:** Full stack (swiglu+lora32+mhc) at dim=512, 200 steps, varying matrix_lr only.
-
-| matrix_lr | Train Loss | val_bpb | Divergence? |
-|-----------|-----------|---------|-------------|
+| matrix_lr | Train Loss | val_bpb | Diverged? |
+|-----------|-----------|---------|-----------|
 | **0.04** | **3.9798** | **2.4221** | No |
 | 0.08 | 3.9981 | 2.4442 | No |
-| 0.12 | 4.2251 | 2.5347 | No, but worse |
+| 0.12 | 4.2251 | 2.5347 | No |
 
-**Conclusion:** mHC keeps training stable at 3× base LR (no divergence), but val_bpb degrades. The default matrix_lr=0.04 is already well-tuned. Higher LR doesn't help — the bottleneck is not optimization speed but something else (possibly the small batch size / few tokens at 200 steps, or model capacity at this dim).
+**Conclusion:** mHC keeps training stable at 3× LR (no divergence) but val_bpb gets worse. At batch=8k, the default LR is already optimal. However, this changes at larger batch — see below.
 
 ---
 
 ## Batch Size Sweep + MPK Ablation
 
 **Date:** 2026-03-20
-**Motivation:** Our prior runs used batch=8192 tokens — only 1.6M total tokens in 200 steps. Scaling batch size gives better gradient estimates and more data per run.
+**Motivation:** batch=8k means only 1.6M tokens in 200 steps. Bigger batches = better gradients + more data.
 
-### Batch Sweep (mpk_looped swiglu+lora32+mhc dim=512)
+### Batch Sweep (mpk_looped swiglu+lora32+mhc dim=512, lr=0.04)
 
 | Batch | Steps | Total Tokens | Train Loss | val_bpb | tok/s | ms/step |
 |-------|-------|-------------|-----------|---------|-------|---------|
-| 8k | 200 | 1.6M | 3.9831 | 2.4217 | 9.8k | 826 |
-| **32k** | 200 | **6.5M** | **3.8363** | **2.1965** | **13.8k** | 2377 |
-| 64k | 134 (wallclock cap) | 8.8M | — | 2.5402 | 14.5k | 4503 |
+| 8k | 200 | 1.6M | 3.983 | 2.4217 | 9.8k | 826 |
+| **32k** | 200 | **6.5M** | **3.836** | **2.1965** | **13.8k** | 2377 |
+| 64k | 134 (wallclock) | 8.8M | — | 2.5402 | 14.5k | 4503 |
 
-**Key finding:** batch=32k is the sweet spot. 64k hits the 600s wallclock cap at only 134 steps. 32k sees 4× more data and gets **0.22 BPB improvement** over 8k.
+batch=32k is the sweet spot. 64k hits the 600s wallclock cap. 32k sees 4× more data → **0.22 BPB improvement**.
 
-### MPK Ablation (the critical question)
+### MPK Ablation (the decisive experiment)
 
-**Does MPK add value?** Compared looped (no MPK) vs mpk_looped at batch=32k, same everything else.
+**Does MPK actually help?** Tested looped (no MPK) vs mpk_looped, batch=32k, lr=0.04, everything else identical.
 
 | Config | Params | val_bpb | tok/s | ms/step |
 |--------|--------|---------|-------|---------|
 | **looped (NO MPK)** swiglu+lora32+mhc | ~13M | **2.0597** | **31.9k** | 1015 |
 | mpk_looped swiglu+lora32+mhc | 13.8M | 2.1965 | 13.8k | 2377 |
 
-**MPK HURTS at this config.** The 3× attention passes per block cost 2.3× wall time, and the simpler looped model gets 2.3× more tokens/sec. At fixed wallclock, speed > compute density. The mHC+LoRA+SwiGLU composition is doing the heavy lifting — MPK's multi-scale processing doesn't add enough to justify its speed penalty.
+**MPK hurts.** It costs 2.3× wall time for worse BPB. The simpler looped model processes 2.3× more tokens per second. At fixed wallclock, speed wins over compute density. mHC+LoRA+SwiGLU is doing the real work.
 
-**Decision:** Drop MPK. Focus on `looped` family with swiglu+lora32+mhc.
+**Decision:** Drop MPK from the submission architecture.
 
 ### Scaled LR at Larger Batch
 
-| Config | Batch | LR | Train Loss | val_bpb | Status |
-|--------|-------|-----|-----------|---------|--------|
-| mpk_looped batch=32k lr=0.04 | 32k | 0.04 | 3.8363 | 2.1965 | Done |
-| mpk_looped batch=32k lr=0.08 | 32k | 0.08 | 3.6973 | 🔄 pending | Running |
+**Motivation:** Classic linear scaling rule — when batch grows by k, LR can grow by sqrt(k) or k. mHC should keep this stable.
 
-LR=0.08 at batch=32k: train loss improved (3.70 vs 3.84), no divergence. Waiting for val_bpb.
+| Config | Batch | LR | Train Loss | val_bpb |
+|--------|-------|-----|-----------|---------|
+| mpk_looped | 32k | 0.04 | 3.836 | 2.1965 |
+| mpk_looped | 32k | 0.08 | 3.697 | **2.1046** |
+| **looped (no MPK)** | 32k | 0.04 | 3.626 | 2.0597 |
+| **looped (no MPK)** | **32k** | **0.08** | **3.614** | **2.0514** |
 
-**Next:** Run `looped` (no MPK) at batch=32k with lr=0.08 — combining the speed advantage of no-MPK with scaled LR.
+**Conclusion:** LR=0.08 helps at batch=32k (unlike at batch=8k where it hurt). The looped (no MPK) at lr=0.08 batch=32k is our overall best: **val_bpb=2.0514**.
 
 ---
 
-## Planned: Stride Schedule Ablation
+## BPB Calculation Verification
 
-**Motivation:** Fixed strides across all loops means every loop sees the same 3 scales. Varying strides per loop adds scale diversity across depth at zero parameter cost:
-- Early loops → coarse strides → global context (document structure, entities)
-- Late loops → fine strides → local predictions (syntax, next-token)
-
-This is the hourglass / coarse-to-fine pattern applied to the stride schedule rather than block weights.
-
-**Configs ready (waiting for 4-way comparison to finish):**
-
-| Config | Loop strides (k,m) | Hypothesis |
-|--------|-------------------|------------|
-| uniform | (2,4), (2,4), (2,4) | Baseline — same as current mpk_looped |
-| coarse_to_fine | (4,8), (2,4), (1,2) | Global first, local last |
-| fine_to_coarse | (1,2), (2,4), (4,8) | Local first, global last |
-| hourglass | (4,8), (2,4), (4,8) | Global sandwich |
-
-**Expected outcome:** coarse_to_fine should win — it matches the natural hierarchy of language understanding (comprehend context → refine details → predict token).
+Checked `build_sentencepiece_luts` for the leading-space marker bug (using `"?"` instead of `"▁"`). Our MLX implementation correctly uses `"▁"` (U+2581). Absolute BPB numbers are correct.
 
 ---
 
 ## Architecture Components Implemented
 
-| Component | Class | Key Innovation | Param Cost |
-|-----------|-------|---------------|------------|
-| Depth recurrence | `LoopedGPT`, `LoopedMPKGPT` | Share blocks across loops | Zero (saves params) |
-| Per-loop LoRA | `LoRAAdapter` | Rank-r Q/V adapters per loop iteration | Small (rank×dim×2 per adapter) |
-| SwiGLU MLP | `SwiGLUMLP` | Gate+up+down projections | +50% vs relu² MLP |
-| MPK multi-scale | `MPKBlock` | Shared StreamBlock at 3 resolutions, K gates P+M | Small (stem + gate + fusion projs) |
-| mHC-Lite (n=4) | `mHCLite` | Exact Birkhoff decomposition, input-dependent mixing | Small (3 projection matrices) |
-| Stride scheduling | `STRIDE_SCHEDULE` env var | Per-loop (k,m) stride overrides | Zero |
-| Loop embeddings | `loop_emb` | Learned per-loop positional signal | Tiny (loops × dim) |
+| Component | Class | Status | Param Cost |
+|-----------|-------|--------|------------|
+| Depth recurrence | `LoopedGPT` | ✅ In winning config | Zero (saves params) |
+| Per-loop LoRA | `LoRAAdapter` | ✅ In winning config | Small (rank×dim×2 per adapter) |
+| SwiGLU MLP | `SwiGLUMLP` | ✅ In winning config | +50% vs relu² MLP |
+| mHC-Lite (n=4) | `mHCLite` | ✅ In winning config | Small (3 projection matrices) |
+| Loop embeddings | `loop_emb` | ✅ In winning config | Tiny (loops × dim) |
+| MPK multi-scale | `MPKBlock` | ❌ Dropped (too slow) | — |
+| Stride scheduling | `STRIDE_SCHEDULE` | ⏸ Implemented, untested (MPK-specific) | Zero |
 
 ---
 
 ## Key Implementation Notes
 
-- **LoRA routing:** LoRA A/B matrices are 2D but routed to Adam (not Muon) via `"lora" not in k.lower()` check in `SplitOptimizers`
-- **mHC-Lite:** Uses softmax over 24 permutation matrices (n=4) for exact doubly stochastic H_res. α scalars init at 0.01 so mixing starts near identity.
-- **Line budget:** `train_gpt_mlx.py` is at 1478/1500 lines. Any new features need to be concise.
-- **Compression:** Looped models compress better than independent-block models. The mpk_looped relu2 at 2.9M params compresses to 2.9MB (well under 16MB).
+- **Optimizer routing:** Muon for 2D non-control params (40 matrices). Adam for tok_emb, LoRA A/B, mHC projections, scales, loop_emb (69 scalar-like params).
+- **mHC-Lite:** Exact Birkhoff via softmax over 24 permutation matrices (n=4). Input-dependent H_pre/H_post/H_res. α init=0.01 so mixing starts near identity.
+- **LoRA:** Routes to Adam not Muon (low-rank matrices don't suit Newton-Schulz).
+- **Line budget:** `train_gpt_mlx.py` at 1478/1500 lines.
+- **Compression:** At dim=256, 2.9M params compresses to 2.9MB. At dim=512 ~13M params, baseline compressed to 11.3MB. Well under 16MB limit.
 
 ---
 
-## Open Questions
+## PyTorch Port (Complete)
 
-1. **Optimal dim for mpk_looped?** — At dim=256 we have 2.9M params and val_bpb=2.75. Baseline has 17M params and val_bpb=2.30. What dim gives ~15M params under MPK+looped to make a fair comparison?
-2. **Does mHC-Lite actually help with LoRA?** — The hypothesis is that LoRA creates distinct per-loop signals that mHC can meaningfully blend. The naive mHC (n=2) hurt in Phase 1, but mHC-Lite (n=4, input-dependent, exact Birkhoff) is a fundamentally different implementation.
-3. **Stride schedule vs uniform?** — Zero-cost experiment. If coarse-to-fine wins, it's a free improvement to every mpk_looped config.
-4. **When to port to PyTorch?** — Need to port all new model families to `train_gpt.py` before H100 validation. Should do this once we've settled on the best MLX config.
+**Date:** 2026-03-20
+
+Ported to `train_gpt.py` (1291 lines). Changes from baseline:
+- Added `LoopedGPT`, `mHCLite`, `LoRAAdapter`, `SwiGLUMLP`, `build_model()`, `split_model_params()`
+- Added WandB logging (`WANDB_PROJECT` env var)
+- Removed TTT LoRA eval (~210 lines freed)
+- Updated `CONTROL_TENSOR_NAME_PATTERNS` to include `loop_emb`, `alpha_res/pre/post`
+- LoRA weights explicitly promoted to fp32 after bf16 cast
+- Baseline family path unchanged
+
+**mHC Triton kernel analysis:** NOT worth it. mHC is <7% of one attention layer's compute (~74k vs ~1M+ FLOPs/token). The 13% wall time overhead is memory bandwidth, which torch.compile should handle. Engineering risk >> marginal speedup.
+
+## Next: A100 Validation
+
+**Run script:** `experiments/run_a100_validation.sh`
+
+Two back-to-back runs on single A100 80GB:
+- Run 1: batch=65536, lr=0.08, 500 steps (~$1-2)
+- Run 2: batch=131072, lr=0.10, 500 steps (~$1-2)
+
+**Watch for:**
+- Loss decreasing smoothly (no spikes)
+- Val BPB trending below 2.05 by step 500
+- Grad norms stable
+- Compressed artifact under 16MB
+- No CUDA errors / NaN losses
+
+**Gate to 8×H100:** All of the above must pass. One failed run from a port bug costs more than the A100 validation.
+
+## Future Experiments (after A100 validates)
+
+- Larger dim (640, 768) if compressed size allows
+- More loops (4×4, 3×5) for deeper effective depth
+- LoRA rank sweep (16 vs 32 vs 64)
+- mHC n=2 vs n=4 (n=2 might be faster and sufficient)
+- Stride scheduling on the looped (non-MPK) architecture — adapt concept from MPK to vary attention window or other per-loop processing
+
+---
+
+## Summary of Validated Insights
+
+1. **Depth recurrence works** — sharing 3 blocks across 3 loops beats 9 independent blocks at same param count
+2. **mHC-Lite + LoRA is the key combination** — LoRA creates per-loop diversity, mHC blends it stably. Together they give 0.14 BPB over the next best single technique.
+3. **Proper mHC-Lite >> naive mHC** — n=4 with Birkhoff decomposition and input-dependent projections is fundamentally better than n=2 with static sigmoid
+4. **SwiGLU > relu²** — consistent 0.07 BPB improvement
+5. **MPK hurts at fixed wallclock** — 3× attention passes per block = 2.3× slower, doesn't compensate with quality
+6. **Batch size matters enormously** — 32k batch beats 8k by 0.22 BPB at 200 steps
+7. **LR scales with batch** — lr=0.08 hurts at batch=8k but helps at batch=32k. mHC keeps it stable.

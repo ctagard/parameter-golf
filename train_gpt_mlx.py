@@ -67,19 +67,31 @@ class Hyperparameters:
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
     max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
-    # Model (defaults match the current baseline setup).
+    # Model architecture.
+    model_family: str = os.environ.get("MODEL_FAMILY", "baseline").strip().lower()
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    mlp_type: str = os.environ.get("MLP_TYPE", "relu2").strip().lower()  # relu2 or swiglu
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    # Depth recurrence (looped family).
+    num_unique_blocks: int = int(os.environ.get("NUM_UNIQUE_BLOCKS", 3))
+    num_loops: int = int(os.environ.get("NUM_LOOPS", 3))
+    lora_rank: int = int(os.environ.get("LORA_RANK", 0))  # 0 = no per-loop LoRA
+    mhc_streams: int = int(os.environ.get("MHC_STREAMS", 0))  # 0 = disabled, 4 = mHC-Lite with 4 streams
+    # MPK strides. STRIDE_SCHEDULE overrides fixed strides with per-loop (k,m) pairs.
+    # Format: "k1,m1;k2,m2;k3,m3" e.g. "4,8;2,4;1,2" for coarse-to-fine
+    mpk_k_stride: int = int(os.environ.get("MPK_K_STRIDE", 2))
+    mpk_m_stride: int = int(os.environ.get("MPK_M_STRIDE", 4))
+    stride_schedule: str = os.environ.get("STRIDE_SCHEDULE", "")  # e.g. "4,8;2,4;1,2"
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -339,7 +351,6 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = dim * mlp_mult
@@ -351,21 +362,32 @@ class MLP(nn.Module):
         return self.proj(x * x)
 
 
+class SwiGLUMLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int):
+        super().__init__()
+        hidden = dim * mlp_mult
+        self.gate_proj = CastedLinear(dim, hidden)
+        self.up_proj = CastedLinear(dim, hidden)
+        self.down_proj = CastedLinear(hidden, dim)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+def make_mlp(dim: int, mlp_mult: int, mlp_type: str = "relu2") -> nn.Module:
+    if mlp_type == "swiglu":
+        return SwiGLUMLP(dim, mlp_mult)
+    return MLP(dim, mlp_mult)
+
+
 class Block(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_base: float, qk_gain_init: float, mlp_type: str = "relu2"):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = make_mlp(dim, mlp_mult, mlp_type)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -379,77 +401,444 @@ class Block(nn.Module):
         return x
 
 
-class GPT(nn.Module):
-    # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
-    # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+class StreamBlock(nn.Module):
+    """Simplified block without resid_mix/x0 — used by MPK streams."""
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_base: float, qk_gain_init: float, mlp_type: str = "relu2"):
         super().__init__()
-        if logit_softcap <= 0.0:
-            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        self.attn_norm = RMSNormNoWeight()
+        self.mlp_norm = RMSNormNoWeight()
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = make_mlp(dim, mlp_mult, mlp_type)
+        self.attn_scale = mx.ones((dim,), dtype=mx.float32)
+        self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        attn_out = self.attn(self.attn_norm(x))
+        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        return x
+
+
+class MPKBlock(nn.Module):
+    """Multi-Pass Keys block: shared weights at full/medium/coarse resolution, K gates P+M."""
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_base: float, qk_gain_init: float, k_stride: int, m_stride: int,
+                 mlp_type: str = "relu2"):
+        super().__init__()
+        self.k_stride = k_stride
+        self.m_stride = m_stride
+        self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
+        self.shared_stem = CastedLinear(dim, dim)
+        self.shared_stream = StreamBlock(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mlp_type)
+        self.k_to_controls = CastedLinear(dim, 4 * dim)
+        self.fusion_norm = RMSNormNoWeight()
+        self.fusion = CastedLinear(2 * dim, dim)
+        self.fusion_scale = mx.ones((dim,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array, x0: mx.array, k_stride: int = 0, m_stride: int = 0) -> mx.array:
+        ks = k_stride if k_stride > 0 else self.k_stride
+        ms = m_stride if m_stride > 0 else self.m_stride
+        mix = self.resid_mix.astype(x.dtype)
+        base = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        base = self.shared_stem(base)
+        seq_len = base.shape[1]
+
+        # P stream: full resolution (skip if ks==1, P is just the base stream processed)
+        p = self.shared_stream(base)
+
+        # K stream: medium resolution
+        if ks > 1:
+            k_in = base[:, ::ks, :]
+            k_out = self.shared_stream(k_in)
+            k = mx.repeat(k_out, ks, axis=1)[:, :seq_len, :]
+        else:
+            k = p  # at stride 1, K collapses to P
+
+        # M stream: coarse resolution
+        if ms > 1:
+            m_in = base[:, ::ms, :]
+            m_out = self.shared_stream(m_in)
+            m = mx.repeat(m_out, ms, axis=1)[:, :seq_len, :]
+        else:
+            m = p  # at stride 1, M collapses to P
+
+        controls = self.k_to_controls(k)
+        c_size = controls.shape[-1] // 4
+        gate_p = controls[..., :c_size]
+        gate_m = controls[..., c_size:2*c_size]
+        shift_p = controls[..., 2*c_size:3*c_size]
+        shift_m = controls[..., 3*c_size:]
+        p = p * (1.0 + mx.tanh(gate_p)) + shift_p
+        m = m * (1.0 + mx.tanh(gate_m)) + shift_m
+
+        fused = self.fusion(mx.concatenate([p, m], axis=-1))
+        return x + self.fusion_scale.astype(x.dtype)[None, None, :] * self.fusion_norm(fused)
+
+
+class LoRAAdapter(nn.Module):
+    """Low-rank adapter: output = x @ A @ B, initialized near zero."""
+    def __init__(self, in_dim: int, out_dim: int, rank: int):
+        super().__init__()
+        self.A = mx.random.normal((in_dim, rank), dtype=mx.float32) * 0.01
+        self.B = mx.zeros((rank, out_dim), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return (x @ self.A.astype(x.dtype)) @ self.B.astype(x.dtype)
+
+
+# ============================================================================
+# mHC-Lite: Manifold-Constrained Hyper-Connections (Lite)
+# ============================================================================
+# Based on arXiv 2601.05732 (mHC-Lite) and 2512.24880 (mHC).
+# Uses exact Birkhoff decomposition: H_res = sum_k a_k * P_k where P_k are
+# all n! permutation matrices and a = softmax(logits). No Sinkhorn needed.
+
+def _build_perm_matrices(n: int) -> mx.array:
+    """Build all n! permutation matrices of size n x n. Returns [n!, n, n]."""
+    from itertools import permutations
+    perms = list(permutations(range(n)))
+    P = np.zeros((len(perms), n, n), dtype=np.float32)
+    for i, perm in enumerate(perms):
+        for row, col in enumerate(perm):
+            P[i, row, col] = 1.0
+    return mx.array(P)
+
+# Precompute for n=4 (24 permutation matrices)
+_PERM4 = None
+def _get_perm4() -> mx.array:
+    global _PERM4
+    if _PERM4 is None:
+        _PERM4 = _build_perm_matrices(4)
+    return _PERM4
+
+
+class mHCLite(nn.Module):
+    """mHC-Lite mixing layer for n=4 streams.
+
+    For each token, computes input-dependent doubly stochastic H_res, plus
+    H_pre (mix streams→1 for layer input) and H_post (distribute output→streams).
+
+    Forward: x_out = H_res @ x_streams + H_post^T * layer_output
+    where layer_output = F(H_pre @ x_streams)
+    """
+    def __init__(self, dim: int, n_streams: int = 4):
+        super().__init__()
+        self.n = n_streams
+        self.dim = dim
+        n_perms = math.factorial(n_streams)  # 24 for n=4
+
+        # Input-dependent projections: from flattened n*dim → logits
+        # H_res: n*dim → n_perms logits (for Birkhoff decomposition)
+        self.res_proj = CastedLinear(n_streams * dim, n_perms)
+        # H_pre: n*dim → n weights (mix streams to 1)
+        self.pre_proj = CastedLinear(n_streams * dim, n_streams)
+        # H_post: n*dim → n weights (distribute output to streams)
+        self.post_proj = CastedLinear(n_streams * dim, n_streams)
+
+        # Small gating scalars (initialized small so mixing starts near identity)
+        self.alpha_res = mx.array(0.01, dtype=mx.float32)
+        self.alpha_pre = mx.array(0.01, dtype=mx.float32)
+        self.alpha_post = mx.array(0.01, dtype=mx.float32)
+
+        # Bias terms initialized so H_res ≈ identity, H_pre ≈ uniform, H_post ≈ uniform
+        self.res_bias = mx.zeros((n_perms,), dtype=mx.float32)
+        self.pre_bias = mx.zeros((n_streams,), dtype=mx.float32)
+        self.post_bias = mx.zeros((n_streams,), dtype=mx.float32)
+
+    def __call__(self, x_streams: mx.array, layer_output: mx.array) -> mx.array:
+        """
+        Args:
+            x_streams: [B, T, n, D] — the n parallel residual streams
+            layer_output: [B, T, D] — output from attention/MLP applied to mixed input
+        Returns:
+            x_out: [B, T, n, D] — updated streams
+        """
+        B, T, n, D = x_streams.shape
+        # Flatten streams for projection: [B, T, n*D]
+        x_flat = x_streams.reshape(B, T, n * D)
+        x_norm = rms_norm(x_flat)
+
+        # H_res: input-dependent doubly stochastic matrix via Birkhoff decomposition
+        res_logits = self.alpha_res * self.res_proj(x_norm) + self.res_bias  # [B, T, n_perms]
+        res_weights = mx.softmax(res_logits, axis=-1)  # [B, T, n_perms]
+        perms = _get_perm4()  # [n_perms, n, n]
+        # H_res = sum_k a_k * P_k: [B, T, n, n]
+        H_res = mx.einsum("btp,pij->btij", res_weights, perms)
+
+        # H_post: distribute layer output back to streams
+        post_logits = self.alpha_post * self.post_proj(x_norm) + self.post_bias  # [B, T, n]
+        H_post = 2.0 * mx.sigmoid(post_logits)  # [B, T, n], range (0, 2)
+
+        # Apply: x_out = H_res @ x_streams + H_post * layer_output
+        # H_res @ x_streams: [B, T, n, n] @ [B, T, n, D] -> [B, T, n, D]
+        x_res = mx.einsum("btij,btjd->btid", H_res, x_streams)
+        # H_post * layer_output: broadcast [B, T, n, 1] * [B, T, 1, D]
+        x_post = H_post[..., None] * layer_output[:, :, None, :]
+        return x_res + x_post
+
+    def mix_to_one(self, x_streams: mx.array) -> mx.array:
+        """Mix n streams down to 1 stream as input to layer function.
+        Args: x_streams [B, T, n, D]. Returns: [B, T, D]."""
+        B, T, n, D = x_streams.shape
+        x_flat = x_streams.reshape(B, T, n * D)
+        x_norm = rms_norm(x_flat)
+        pre_logits = self.alpha_pre * self.pre_proj(x_norm) + self.pre_bias  # [B, T, n]
+        H_pre = mx.sigmoid(pre_logits)  # [B, T, n], range (0, 1)
+        # Weighted sum: [B, T, n, 1] * [B, T, n, D] -> sum over n -> [B, T, D]
+        return (H_pre[..., None] * x_streams).sum(axis=2)
+
+
+# ============================================================================
+# MODEL VARIANTS
+# ============================================================================
+
+class BaseModel(nn.Module):
+    """Base class with shared logit/loss computation for all model families."""
+    def __init__(self, vocab_size: int, dim: int, logit_chunk_tokens: int,
+                 logit_softcap: float, tied_embed_init_std: float):
+        super().__init__()
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
-
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
-        self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
-        ]
         self.final_norm = RMSNormNoWeight()
-
-        for b in self.blocks:
-            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
-            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
         self.tok_emb.weight = (
-            mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
+            mx.random.normal((vocab_size, dim), dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
 
     def softcap(self, logits: mx.array) -> mx.array:
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
+    def _zero_init_proj(self, blocks):
+        for b in blocks:
+            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
+            if hasattr(b.mlp, 'proj'):
+                b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+            if hasattr(b.mlp, 'down_proj'):
+                b.mlp.down_proj.weight = mx.zeros_like(b.mlp.down_proj.weight)
+
+    def __call__(self, input_ids: mx.array) -> mx.array:
+        raise NotImplementedError
+
+    def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
+        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        y = target_ids.reshape(-1)
+        if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
+            logits = self.softcap(x @ self.tok_emb.weight.astype(x.dtype).T)
+            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+        loss_sum = mx.array(0.0, dtype=mx.float32)
+        n = int(x.shape[0])
+        for s in range(0, n, self.logit_chunk_tokens):
+            e = min(s + self.logit_chunk_tokens, n)
+            logits = self.softcap(x[s:e] @ self.tok_emb.weight.astype(x.dtype).T)
+            loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
+        return loss_sum / float(n)
+
+
+class GPT(BaseModel):
+    """Baseline GPT with encoder-decoder skip connections."""
+    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
+                 qk_gain_init: float, mlp_type: str = "relu2"):
+        super().__init__(vocab_size, dim, logit_chunk_tokens, logit_softcap, tied_embed_init_std)
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        self.blocks = [Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mlp_type)
+                       for _ in range(num_layers)]
+        self._zero_init_proj(self.blocks)
+
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
         skips: list[mx.array] = []
-
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
         return self.final_norm(x)
 
-    def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
-        y = target_ids.reshape(-1)
-        if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
-            logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
-            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
 
-        loss_sum = mx.array(0.0, dtype=mx.float32)
-        n = int(x.shape[0])
-        for s in range(0, n, self.logit_chunk_tokens):
-            e = min(s + self.logit_chunk_tokens, n)
-            logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
-            loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
-        return loss_sum / float(n)
+class LoopedGPT(BaseModel):
+    """Depth-recurrent GPT: num_unique_blocks shared blocks looped num_loops times.
+    Optional per-loop LoRA adapters on Q/V projections."""
+    def __init__(self, vocab_size: int, num_unique_blocks: int, num_loops: int, dim: int,
+                 num_heads: int, num_kv_heads: int, mlp_mult: int, lora_rank: int,
+                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float,
+                 tied_embed_init_std: float, qk_gain_init: float, mlp_type: str = "relu2"):
+        super().__init__(vocab_size, dim, logit_chunk_tokens, logit_softcap, tied_embed_init_std)
+        self.num_unique_blocks = num_unique_blocks
+        self.num_loops = num_loops
+        self.lora_rank = lora_rank
+        self.blocks = [Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mlp_type)
+                       for _ in range(num_unique_blocks)]
+        self._zero_init_proj(self.blocks)
+        # Learned loop embeddings
+        self.loop_emb = mx.zeros((num_loops, dim), dtype=mx.float32)
+        # Per-loop LoRA adapters on Q and V
+        if lora_rank > 0:
+            kv_dim = num_kv_heads * (dim // num_heads)
+            self.loop_lora_q = [[LoRAAdapter(dim, dim, lora_rank) for _ in range(num_unique_blocks)]
+                                for _ in range(num_loops)]
+            self.loop_lora_v = [[LoRAAdapter(dim, kv_dim, lora_rank) for _ in range(num_unique_blocks)]
+                                for _ in range(num_loops)]
+
+    def __call__(self, input_ids: mx.array) -> mx.array:
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x0 = x
+        for loop_idx in range(self.num_loops):
+            loop_signal = self.loop_emb[loop_idx].astype(x.dtype)
+            for block_idx, block in enumerate(self.blocks):
+                x_in = x + loop_signal[None, None, :]
+                if self.lora_rank > 0:
+                    # Apply LoRA deltas to attention input before block processes it
+                    normed = block.attn_norm(x_in)
+                    q_delta = self.loop_lora_q[loop_idx][block_idx](normed)
+                    v_delta = self.loop_lora_v[loop_idx][block_idx](normed)
+                    # Store deltas for the attention to use — we add directly to q/v projections
+                    block.attn._lora_q_delta = q_delta
+                    block.attn._lora_v_delta = v_delta
+                x = block(x_in, x0)
+                if self.lora_rank > 0:
+                    block.attn._lora_q_delta = None
+                    block.attn._lora_v_delta = None
+        return self.final_norm(x)
+
+
+class MPKGPT(BaseModel):
+    """Multi-Pass Keys GPT: sequential MPKBlocks without skip connections."""
+    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int,
+                 mlp_mult: int, logit_chunk_tokens: int, logit_softcap: float, rope_base: float,
+                 tied_embed_init_std: float, qk_gain_init: float, k_stride: int, m_stride: int,
+                 mlp_type: str = "relu2"):
+        super().__init__(vocab_size, dim, logit_chunk_tokens, logit_softcap, tied_embed_init_std)
+        self.blocks = [MPKBlock(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                                k_stride, m_stride, mlp_type)
+                       for _ in range(num_layers)]
+        # Zero-init the fusion and shared_stream projections
+        for b in self.blocks:
+            b.fusion.weight = mx.zeros_like(b.fusion.weight)
+            b.k_to_controls.weight = mx.zeros_like(b.k_to_controls.weight)
+            self._zero_init_proj([b.shared_stream])
+
+    def __call__(self, input_ids: mx.array) -> mx.array:
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x0 = x
+        for block in self.blocks:
+            x = block(x, x0)
+        return self.final_norm(x)
+
+
+class LoopedMPKGPT(BaseModel):
+    """MPK + depth recurrence + optional per-loop LoRA + optional mHC-Lite + optional stride schedule."""
+    def __init__(self, vocab_size: int, num_unique_blocks: int, num_loops: int, dim: int,
+                 num_heads: int, num_kv_heads: int, mlp_mult: int, lora_rank: int,
+                 mhc_streams: int, stride_schedule: str, logit_chunk_tokens: int,
+                 logit_softcap: float, rope_base: float, tied_embed_init_std: float,
+                 qk_gain_init: float, k_stride: int, m_stride: int, mlp_type: str = "relu2"):
+        super().__init__(vocab_size, dim, logit_chunk_tokens, logit_softcap, tied_embed_init_std)
+        self.num_unique_blocks = num_unique_blocks
+        self.num_loops = num_loops
+        self.lora_rank = lora_rank
+        self.mhc_streams = mhc_streams
+        # Parse stride schedule: "4,8;2,4;1,2" → [(4,8), (2,4), (1,2)]
+        if stride_schedule:
+            self.stride_schedule = [tuple(int(x) for x in pair.split(","))
+                                    for pair in stride_schedule.split(";")]
+            if len(self.stride_schedule) != num_loops:
+                raise ValueError(f"STRIDE_SCHEDULE has {len(self.stride_schedule)} entries but NUM_LOOPS={num_loops}")
+        else:
+            self.stride_schedule = [(k_stride, m_stride)] * num_loops  # uniform
+        self.blocks = [MPKBlock(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                                k_stride, m_stride, mlp_type)
+                       for _ in range(num_unique_blocks)]
+        self.loop_emb = mx.zeros((num_loops, dim), dtype=mx.float32)
+        # Per-loop LoRA on the shared_stream attention (Q/V)
+        if lora_rank > 0:
+            kv_dim = num_kv_heads * (dim // num_heads)
+            self.loop_lora_q = [[LoRAAdapter(dim, dim, lora_rank) for _ in range(num_unique_blocks)]
+                                for _ in range(num_loops)]
+            self.loop_lora_v = [[LoRAAdapter(dim, kv_dim, lora_rank) for _ in range(num_unique_blocks)]
+                                for _ in range(num_loops)]
+        # mHC-Lite: one mixing layer per unique block (shared across loops)
+        if mhc_streams == 4:
+            self.mhc = [mHCLite(dim, n_streams=4) for _ in range(num_unique_blocks)]
+        for b in self.blocks:
+            b.fusion.weight = mx.zeros_like(b.fusion.weight)
+            b.k_to_controls.weight = mx.zeros_like(b.k_to_controls.weight)
+            self._zero_init_proj([b.shared_stream])
+
+    def _apply_lora(self, block, loop_idx, block_idx, x):
+        if self.lora_rank > 0:
+            attn = block.shared_stream.attn
+            normed = block.shared_stream.attn_norm(x)
+            attn._lora_q_delta = self.loop_lora_q[loop_idx][block_idx](normed)
+            attn._lora_v_delta = self.loop_lora_v[loop_idx][block_idx](normed)
+
+    def _clear_lora(self, block):
+        if self.lora_rank > 0:
+            block.shared_stream.attn._lora_q_delta = None
+            block.shared_stream.attn._lora_v_delta = None
+
+    def __call__(self, input_ids: mx.array) -> mx.array:
+        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x0 = x
+
+        if self.mhc_streams == 4:
+            B, T, D = x.shape
+            n = 4
+            x_s = mx.broadcast_to(x[:, :, None, :], (B, T, n, D))
+            for loop_idx in range(self.num_loops):
+                loop_signal = self.loop_emb[loop_idx].astype(x.dtype)
+                ks, ms = self.stride_schedule[loop_idx]
+                for block_idx, block in enumerate(self.blocks):
+                    x_in = self.mhc[block_idx].mix_to_one(x_s) + loop_signal[None, None, :]
+                    self._apply_lora(block, loop_idx, block_idx, x_in)
+                    block_out = block(x_in, x0, k_stride=ks, m_stride=ms)
+                    self._clear_lora(block)
+                    x_s = self.mhc[block_idx](x_s, block_out)
+            x = x_s.mean(axis=2)
+        else:
+            for loop_idx in range(self.num_loops):
+                loop_signal = self.loop_emb[loop_idx].astype(x.dtype)
+                ks, ms = self.stride_schedule[loop_idx]
+                for block_idx, block in enumerate(self.blocks):
+                    x_in = x + loop_signal[None, None, :]
+                    self._apply_lora(block, loop_idx, block_idx, x_in)
+                    x = block(x_in, x0, k_stride=ks, m_stride=ms)
+                    self._clear_lora(block)
+
+        return self.final_norm(x)
+
+
+def build_model(args: Hyperparameters) -> nn.Module:
+    """Factory function to create model based on MODEL_FAMILY."""
+    common = dict(vocab_size=args.vocab_size, dim=args.model_dim, logit_chunk_tokens=args.logit_chunk_tokens,
+                  logit_softcap=args.logit_softcap, tied_embed_init_std=args.tied_embed_init_std,
+                  qk_gain_init=args.qk_gain_init, rope_base=args.rope_base,
+                  num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+                  mlp_type=args.mlp_type)
+
+    if args.model_family in ("baseline", "gpt"):
+        return GPT(num_layers=args.num_layers, **common)
+    if args.model_family == "looped":
+        return LoopedGPT(num_unique_blocks=args.num_unique_blocks, num_loops=args.num_loops,
+                         lora_rank=args.lora_rank, **common)
+    if args.model_family == "mpk":
+        return MPKGPT(num_layers=args.num_layers, k_stride=args.mpk_k_stride,
+                      m_stride=args.mpk_m_stride, **common)
+    if args.model_family == "mpk_looped":
+        return LoopedMPKGPT(num_unique_blocks=args.num_unique_blocks, num_loops=args.num_loops,
+                            lora_rank=args.lora_rank, mhc_streams=args.mhc_streams,
+                            stride_schedule=args.stride_schedule,
+                            k_stride=args.mpk_k_stride, m_stride=args.mpk_m_stride, **common)
+    raise ValueError(f"Unknown MODEL_FAMILY={args.model_family!r}")
+
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
@@ -483,23 +872,22 @@ class Muon:
 
 
 class SplitOptimizers:
-    # - embeddings: Adam with the tied-embedding LR
-    # - block matrices (2D): Muon
-    # - block scalars + skip weights: Adam
-    # This preserves the high-level optimization behavior even though MLX internals differ.
-    def __init__(self, model: GPT, args: Hyperparameters):
+    # - tok_emb.weight: Adam with the tied-embedding LR
+    # - 2D non-control params: Muon
+    # - everything else (scalars, control tensors, LoRA, loop_emb, skip_weights): Adam
+    def __init__(self, model: nn.Module, args: Hyperparameters):
         self.args = args
         params = dict(tree_flatten(model.parameters()))
         self.embed_key = "tok_emb.weight"
         self.matrix_keys = [
-            k
-            for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            k for k, p in params.items()
+            if k != self.embed_key and p.ndim == 2
+            and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            and "lora" not in k.lower()
         ]
         self.scalar_keys = [
-            k
-            for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            k for k, p in params.items()
+            if k != self.embed_key and k not in self.matrix_keys
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -885,19 +1273,7 @@ def main() -> None:
     # ==============================================================================
     # MODEL + OPTIMIZER SETUP
     # ==============================================================================
-    model = GPT(
-        vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
-        dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
-        logit_chunk_tokens=args.logit_chunk_tokens,
-        logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
-        tied_embed_init_std=args.tied_embed_init_std,
-        qk_gain_init=args.qk_gain_init,
-    )
+    model = build_model(args)
     opt = SplitOptimizers(model, args)
 
     # ==============================================================================
@@ -932,9 +1308,9 @@ def main() -> None:
         log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}")
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
-        f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
-        f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
-        f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
+        f"model_family:{args.model_family} model_params:{n_params} "
+        f"vocab_size:{args.vocab_size} dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
+        f"mlp_type:{args.mlp_type} seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
@@ -951,11 +1327,9 @@ def main() -> None:
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
-    log(
-        f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
-        f"skip_weights:{model.skip_weights.dtype}"
-    )
+    first_block = model.blocks[0]
+    first_attn = first_block.shared_stream.attn if hasattr(first_block, 'shared_stream') else first_block.attn
+    log(f"dtypes tok_emb:{model.tok_emb.weight.dtype} linear_weight:{first_attn.c_q.weight.dtype}")
 
     # ==============================================================================
     # TRAINING LOOP
