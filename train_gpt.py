@@ -755,30 +755,30 @@ class HypernetEMA(nn.Module):
         return new_ema.detach(), delta.unsqueeze(1)           # detach stops grad through history
 
 class HypernetSSM(nn.Module):
-    """Content-dependent recurrence across loops via minimal SSM.
-    Unlike EMA's fixed alpha, the forget/update rates depend on what the residual stream contains."""
+    """SSM + attention pooling across loops. Learns which tokens matter (no .mean())."""
     def __init__(self, dim: int, d_state: int = 16, rank: int = 32, stride: int = 4):
         super().__init__()
-        self.stride = stride
         self.rank = rank
         self.d_state = d_state
         self.in_proj = CastedLinear(dim, rank, bias=False)
+        self.pool_q = nn.Parameter(torch.randn(1, 1, rank) * 0.02)  # learned pooling query
         self.A_log = nn.Parameter(torch.log(torch.arange(1, d_state + 1).float()).unsqueeze(0).expand(rank, -1))
         self.BC_proj = CastedLinear(rank, 2 * d_state, bias=False)
         self.dt_proj = CastedLinear(rank, rank, bias=True)
         self.out_proj = CastedLinear(rank, dim, bias=False)
         self.out_proj._zero_init = True
     def forward(self, h: Tensor, x: Tensor) -> tuple[Tensor, Tensor]:
-        coarse = x[:, ::self.stride, :].mean(dim=1)
-        u = self.in_proj(coarse)
-        BC = self.BC_proj(u)
-        B, C = BC.chunk(2, dim=-1)
-        dt = F.softplus(self.dt_proj(u))
-        A = -torch.exp(self.A_log.to(dtype=u.dtype))
+        u = self.in_proj(x)                                          # [B, T, rank]
+        pool_w = torch.softmax(self.pool_q @ u.transpose(-2, -1), dim=-1)  # [B, 1, T]
+        u_pooled = (pool_w @ u).squeeze(1)                           # [B, rank]
+        BC = self.BC_proj(u_pooled)
+        B_gate, C_gate = BC.chunk(2, dim=-1)
+        dt = F.softplus(self.dt_proj(u_pooled))
+        A = -torch.exp(self.A_log.to(dtype=u_pooled.dtype))
         dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0))
-        dB = dt.unsqueeze(-1) * B.unsqueeze(1)
-        new_h = h * dA + dB * u.unsqueeze(-1)
-        y = (new_h * C.unsqueeze(1)).sum(-1)
+        dB = dt.unsqueeze(-1) * B_gate.unsqueeze(1)
+        new_h = h * dA + dB * u_pooled.unsqueeze(-1)
+        y = (new_h * C_gate.unsqueeze(1)).sum(-1)
         delta = self.out_proj(y)
         return new_h.detach(), delta.unsqueeze(1)
 
