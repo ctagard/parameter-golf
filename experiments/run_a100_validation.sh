@@ -18,7 +18,7 @@ MAX_WALLCLOCK_SECONDS=0 WARMUP_STEPS=20 \
 WANDB_PROJECT=parameter-golf"
 
 echo "=========================================="
-echo "Run 1/2: No hypernetwork (table-stakes baseline)"
+echo "Run 1/3: No hypernetwork (table-stakes baseline)"
 echo "=========================================="
 env $COMMON \
   RUN_ID=no_hyper_tablestakes SEED=1337 \
@@ -26,15 +26,23 @@ env $COMMON \
 
 echo ""
 echo "=========================================="
-echo "Run 2/2: Hypernetwork Variant C (coarse stride=4)"
+echo "Run 2/3: Hypernetwork coarse (delta-from-origin)"
 echo "=========================================="
 env $COMMON \
   HYPERNET_VARIANT=coarse \
-  RUN_ID=hyper_coarse_tablestakes SEED=1337 \
+  RUN_ID=hyper_coarse_delta SEED=1337 \
   torchrun --standalone --nproc_per_node=1 train_gpt.py
 
 echo ""
 echo "=========================================="
-echo "Both runs complete. Check logs/ and WandB for results."
-echo "Compare val_bpb at steps 100/200/300 between the two runs."
+echo "Run 3/3: Hypernetwork EMA (trajectory across loops)"
+echo "=========================================="
+env $COMMON \
+  HYPERNET_VARIANT=ema \
+  RUN_ID=hyper_ema_trajectory SEED=1337 \
+  torchrun --standalone --nproc_per_node=1 train_gpt.py
+
+echo ""
+echo "=========================================="
+echo "All 3 runs complete. Compare val_bpb at steps 100/200/300."
 echo "=========================================="

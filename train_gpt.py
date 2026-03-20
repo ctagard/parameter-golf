@@ -738,18 +738,21 @@ class HypernetCoarse(nn.Module):
         return self.up(F.silu(self.down(delta))).unsqueeze(1)  # [B, 1, D]
 
 class HypernetEMA(nn.Module):
-    """EMA across loops → rank-r bottleneck → broadcast delta for Q."""
-    def __init__(self, dim: int, rank: int = 32):
+    """EMA trajectory across loops → rank-r bottleneck → broadcast delta for Q.
+    Per-dim learned decay: some dims long-memory (topic), others fast-updating (syntax)."""
+    def __init__(self, dim: int, rank: int = 32, stride: int = 4):
         super().__init__()
-        self.alpha = nn.Parameter(torch.full((dim,), 0.9, dtype=torch.float32))
+        self.stride = stride
+        self.alpha_logit = nn.Parameter(torch.zeros(dim, dtype=torch.float32))  # sigmoid(0)=0.5
         self.down = CastedLinear(dim, rank, bias=False)
         self.up = CastedLinear(rank, dim, bias=False)
         self.up._zero_init = True
-    def update_ema(self, ema: Tensor, x: Tensor) -> Tensor:
-        a = torch.sigmoid(self.alpha).to(dtype=x.dtype)
-        return a * ema + (1 - a) * x.mean(dim=1)
-    def condition(self, ema: Tensor) -> Tensor:
-        return self.up(F.silu(self.down(ema))).unsqueeze(1)  # [B, 1, D]
+    def forward(self, ema: Tensor, x: Tensor) -> tuple[Tensor, Tensor]:
+        alpha = torch.sigmoid(self.alpha_logit).to(dtype=x.dtype)
+        coarse = x[:, ::self.stride, :].mean(dim=1)          # [B, D]
+        new_ema = alpha * ema + (1 - alpha) * coarse          # [B, D]
+        delta = self.up(F.silu(self.down(new_ema)))           # [B, D]
+        return new_ema.detach(), delta.unsqueeze(1)           # detach stops grad through history
 
 class SmearGate(nn.Module):
     def __init__(self, dim: int):
@@ -956,7 +959,7 @@ class LoopedGPT(nn.Module):
         if hypernet_variant == "coarse":
             self.hypernet = HypernetCoarse(model_dim, hypernet_rank, hypernet_stride)
         elif hypernet_variant == "ema":
-            self.hypernet = HypernetEMA(model_dim, hypernet_rank)
+            self.hypernet = HypernetEMA(model_dim, hypernet_rank, hypernet_stride)
         self._init_weights(tied_embed_init_std)
 
     def _init_weights(self, std: float) -> None:
@@ -1005,8 +1008,7 @@ class LoopedGPT(nn.Module):
                     hyper_delta = self.hypernet(x_mixed, x0)
                 elif isinstance(self.hypernet, HypernetEMA):
                     x_mixed = self.mhc[0].mix_to_one(x_s) if loop_idx > 0 else x
-                    ema = self.hypernet.update_ema(ema if ema is not None else torch.zeros(B, D, device=x.device, dtype=x.dtype), x_mixed)
-                    hyper_delta = self.hypernet.condition(ema.detach())
+                    ema, hyper_delta = self.hypernet(ema if ema is not None else torch.zeros(B, D, device=x.device, dtype=x.dtype), x_mixed)
                 for bi, block in enumerate(self.blocks):
                     x_in = self.mhc[bi].mix_to_one(x_s) + ls
                     qd, vd = self._get_deltas(loop_idx, bi, hyper_delta)
@@ -1021,8 +1023,7 @@ class LoopedGPT(nn.Module):
                     hyper_delta = self.hypernet(x, x0)
                 elif isinstance(self.hypernet, HypernetEMA):
                     B, T, D = x.shape
-                    ema = self.hypernet.update_ema(ema if ema is not None else torch.zeros(B, D, device=x.device, dtype=x.dtype), x)
-                    hyper_delta = self.hypernet.condition(ema.detach())
+                    ema, hyper_delta = self.hypernet(ema if ema is not None else torch.zeros(B, D, device=x.device, dtype=x.dtype), x)
                 for bi, block in enumerate(self.blocks):
                     x_in = x + ls
                     qd, vd = self._get_deltas(loop_idx, bi, hyper_delta)
