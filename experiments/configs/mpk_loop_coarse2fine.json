@@ -1,0 +1,12 @@
+{
+    "description": "MPK looped coarse-to-fine: (4,8) → (2,4) → (1,2)",
+    "env": {
+        "MODEL_FAMILY": "mpk_looped",
+        "NUM_UNIQUE_BLOCKS": 3,
+        "NUM_LOOPS": 3,
+        "MODEL_DIM": 256,
+        "NUM_HEADS": 8,
+        "NUM_KV_HEADS": 2,
+        "STRIDE_SCHEDULE": "4,8;2,4;1,2"
+    }
+}

@@ -1,0 +1,13 @@
+{
+    "description": "MPK + depth recurrence: 3 MPKBlocks x 3 loops, dim=384",
+    "env": {
+        "MODEL_FAMILY": "mpk_looped",
+        "NUM_UNIQUE_BLOCKS": 3,
+        "NUM_LOOPS": 3,
+        "MODEL_DIM": 384,
+        "NUM_HEADS": 6,
+        "NUM_KV_HEADS": 2,
+        "MPK_K_STRIDE": 2,
+        "MPK_M_STRIDE": 4
+    }
+}

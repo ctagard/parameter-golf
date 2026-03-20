@@ -1,0 +1,12 @@
+{
+    "description": "MPK: 8 layers, dim=384, k_stride=2, m_stride=4",
+    "env": {
+        "MODEL_FAMILY": "mpk",
+        "NUM_LAYERS": 8,
+        "MODEL_DIM": 384,
+        "NUM_HEADS": 6,
+        "NUM_KV_HEADS": 2,
+        "MPK_K_STRIDE": 2,
+        "MPK_M_STRIDE": 4
+    }
+}

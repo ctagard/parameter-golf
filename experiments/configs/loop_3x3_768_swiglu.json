@@ -1,0 +1,12 @@
+{
+    "description": "Looped 3x3 dim=768 + SwiGLU MLP",
+    "env": {
+        "MODEL_FAMILY": "looped",
+        "NUM_UNIQUE_BLOCKS": 3,
+        "NUM_LOOPS": 3,
+        "MODEL_DIM": 768,
+        "NUM_HEADS": 12,
+        "NUM_KV_HEADS": 4,
+        "MLP_TYPE": "swiglu"
+    }
+}

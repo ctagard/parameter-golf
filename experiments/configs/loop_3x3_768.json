@@ -1,0 +1,11 @@
+{
+    "description": "Depth recurrence: 3 blocks x 3 loops, dim=768",
+    "env": {
+        "MODEL_FAMILY": "looped",
+        "NUM_UNIQUE_BLOCKS": 3,
+        "NUM_LOOPS": 3,
+        "MODEL_DIM": 768,
+        "NUM_HEADS": 12,
+        "NUM_KV_HEADS": 4
+    }
+}
