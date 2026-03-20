@@ -725,16 +725,17 @@ class mHCLite(nn.Module):
 
 
 class HypernetCoarse(nn.Module):
-    """Coarse-stride pooling → rank-r bottleneck → broadcast delta for Q."""
+    """Delta-from-origin at coarse stride → rank-r bottleneck → broadcast delta for Q.
+    Reads what looping has changed from x0, not absolute state."""
     def __init__(self, dim: int, rank: int = 32, stride: int = 4):
         super().__init__()
         self.stride = stride
         self.down = CastedLinear(dim, rank, bias=False)
         self.up = CastedLinear(rank, dim, bias=False)
         self.up._zero_init = True
-    def forward(self, x: Tensor) -> Tensor:
-        coarse = x[:, ::self.stride, :].mean(dim=1)  # [B, D]
-        return self.up(F.silu(self.down(coarse))).unsqueeze(1)  # [B, 1, D]
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        delta = (x - x0)[:, ::self.stride, :].mean(dim=1)  # [B, D] — what loops changed
+        return self.up(F.silu(self.down(delta))).unsqueeze(1)  # [B, 1, D]
 
 class HypernetEMA(nn.Module):
     """EMA across loops → rank-r bottleneck → broadcast delta for Q."""
@@ -1001,7 +1002,7 @@ class LoopedGPT(nn.Module):
                 hyper_delta = None
                 if isinstance(self.hypernet, HypernetCoarse):
                     x_mixed = self.mhc[0].mix_to_one(x_s) if loop_idx > 0 else x
-                    hyper_delta = self.hypernet(x_mixed)
+                    hyper_delta = self.hypernet(x_mixed, x0)
                 elif isinstance(self.hypernet, HypernetEMA):
                     x_mixed = self.mhc[0].mix_to_one(x_s) if loop_idx > 0 else x
                     ema = self.hypernet.update_ema(ema if ema is not None else torch.zeros(B, D, device=x.device, dtype=x.dtype), x_mixed)
@@ -1017,7 +1018,7 @@ class LoopedGPT(nn.Module):
                 ls = self.loop_emb[loop_idx].to(x.dtype)
                 hyper_delta = None
                 if isinstance(self.hypernet, HypernetCoarse):
-                    hyper_delta = self.hypernet(x)
+                    hyper_delta = self.hypernet(x, x0)
                 elif isinstance(self.hypernet, HypernetEMA):
                     B, T, D = x.shape
                     ema = self.hypernet.update_ema(ema if ema is not None else torch.zeros(B, D, device=x.device, dtype=x.dtype), x)
