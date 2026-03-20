@@ -39,9 +39,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# -----------------------------
 # HYPERPARAMETERS
-# -----------------------------
 # Default Simple Baseline run:
 # - 9 transformer blocks at width 512
 # - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
@@ -119,9 +117,7 @@ class Hyperparameters:
     hypernet_rank = int(os.environ.get("HYPERNET_RANK", 32))
     hypernet_stride = int(os.environ.get("HYPERNET_STRIDE", 4))
 
-# -----------------------------
-# MUON OPTIMIZER 
-# -----------------------------
+# MUON OPTIMIZER
 # 
 # As borrowed from modded-nanogpt
 # Background on Muon: https://kellerjordan.github.io/posts/muon/
@@ -203,9 +199,7 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-# -----------------------------
 # TOKENIZER-AGNOSTIC EVALUATION SETUP 
-# -----------------------------
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
 # Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
@@ -312,9 +306,7 @@ def eval_val(
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
-# -----------------------------
 # POST-TRAINING QUANTIZATION
-# -----------------------------
 #
 # It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
 # Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
@@ -455,9 +447,7 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
-# -----------------------------
 # DATA LOADING 
-# -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
@@ -526,9 +516,7 @@ class DistributedTokenLoader:
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
-# -----------------------------
 # TRANSFORMER MODULES
-# -----------------------------
 
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
@@ -724,35 +712,43 @@ class mHCLite(nn.Module):
         return (H_pre.unsqueeze(-1) * x_streams).sum(dim=2)
 
 
+class _AttnPool(nn.Module):
+    """Learned attention pooling: query attends over T positions → single vector. No .mean()."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.q = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+    def forward(self, x: Tensor) -> Tensor:
+        w = torch.softmax(self.q @ x.transpose(-2, -1) / x.size(-1)**0.5, dim=-1)  # [B,1,T]
+        return (w @ x).squeeze(1)  # [B, D]
+
 class HypernetCoarse(nn.Module):
-    """Delta-from-origin at coarse stride → rank-r bottleneck → broadcast delta for Q.
-    Reads what looping has changed from x0, not absolute state."""
+    """Delta-from-origin + attention pooling → rank-r → Q delta."""
     def __init__(self, dim: int, rank: int = 32, stride: int = 4):
         super().__init__()
-        self.stride = stride
+        self.pool = _AttnPool(dim)
         self.down = CastedLinear(dim, rank, bias=False)
         self.up = CastedLinear(rank, dim, bias=False)
         self.up._zero_init = True
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        delta = (x - x0)[:, ::self.stride, :].mean(dim=1)  # [B, D] — what loops changed
-        return self.up(F.silu(self.down(delta))).unsqueeze(1)  # [B, 1, D]
+        context = self.pool(x - x0)  # [B, D] — learned pooling over what loops changed
+        return self.up(F.silu(self.down(context))).unsqueeze(1)
 
 class HypernetEMA(nn.Module):
-    """EMA trajectory across loops → rank-r bottleneck → broadcast delta for Q.
-    Per-dim learned decay: some dims long-memory (topic), others fast-updating (syntax)."""
+    """EMA trajectory + attention pooling across loops. Per-dim learned decay."""
     def __init__(self, dim: int, rank: int = 32, stride: int = 4):
         super().__init__()
-        self.stride = stride
-        self.alpha_logit = nn.Parameter(torch.zeros(dim, dtype=torch.float32))  # sigmoid(0)=0.5
+        self.pool = _AttnPool(dim)
+        self.rank = rank  # needed for h_state init check
+        self.alpha_logit = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
         self.down = CastedLinear(dim, rank, bias=False)
         self.up = CastedLinear(rank, dim, bias=False)
         self.up._zero_init = True
     def forward(self, ema: Tensor, x: Tensor) -> tuple[Tensor, Tensor]:
         alpha = torch.sigmoid(self.alpha_logit).to(dtype=x.dtype)
-        coarse = x[:, ::self.stride, :].mean(dim=1)          # [B, D]
-        new_ema = alpha * ema + (1 - alpha) * coarse          # [B, D]
-        delta = self.up(F.silu(self.down(new_ema)))           # [B, D]
-        return new_ema.detach(), delta.unsqueeze(1)           # detach stops grad through history
+        pooled = self.pool(x)  # [B, D] — learned pooling, not mean
+        new_ema = alpha * ema + (1 - alpha) * pooled
+        delta = self.up(F.silu(self.down(new_ema)))
+        return new_ema.detach(), delta.unsqueeze(1)
 
 class HypernetSSM(nn.Module):
     """SSM + attention pooling across loops. Learns which tokens matter (no .mean())."""
@@ -1106,9 +1102,7 @@ def split_model_params(model: nn.Module) -> tuple[Tensor, list[Tensor], list[Ten
             scalar_params.append(p)
     return tok_param, head_params, matrix_params, scalar_params
 
-# -----------------------------
 # TRAINING
-# -----------------------------
 
 def main() -> None:
     global zeropower_via_newtonschulz5
