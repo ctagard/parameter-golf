@@ -176,29 +176,48 @@ LR=0.08 helps at batch=32k. Best MLX result: **val_bpb=2.0514**.
 
 `x.mean(dim=1)` produces a vector representing the "average token" — but the information needed for loop conditioning is the *structure*, not the average. Which topics are present, what entities have been introduced, how has the representation evolved since the last loop. Two completely different documents can have nearly identical means.
 
-### Two Better Approaches (now implemented, running on A100)
+### Three Approaches (all with learned attention pooling — no .mean() anywhere)
 
-**Variant 1: Delta-from-origin (HypernetCoarse with x - x0)**
-- Instead of reading absolute state, reads `(x - x0)` — what the loops have actually changed
-- x0 is constant across all loops, so the delta isolates what looping contributes
-- At early training, delta is near zero (safe). Grows informative as loops learn meaningful updates
-- Coarse stride still applied for efficiency
+All variants now use `_AttnPool`: a learned query that attends over T positions to produce a single summary vector. This replaces the uniform `.mean()` that killed the first hypernetwork attempt.
 
-**Variant 2: EMA trajectory (HypernetEMA)**
-- Maintains exponential moving average of residual state across loop iterations
-- Per-dimension learned decay: some dims long-memory (topic), others fast-updating (syntax)
-- `alpha_logit=0` init → sigmoid(0)=0.5 → equal weighting of current and past
+**Variant 1: Delta-from-origin (`HYPERNET_VARIANT=coarse`)**
+- Reads `_AttnPool(x - x0)` — learned pooling over what the loops have changed
+- x0 is constant across loops, so the delta isolates what looping contributes
+- Simplest variant: no cross-loop state, just reads current delta
+
+**Variant 2: EMA trajectory (`HYPERNET_VARIANT=ema`)**
+- `_AttnPool(x)` → per-dim learned decay EMA across loop iterations
+- Encodes trajectory / direction, not just current state
+- `alpha_logit=0` init → sigmoid(0)=0.5, per-dim learned decay rates
 - `.detach()` on EMA prevents O(loops²) backward graphs
-- For TTT: adapting the decay rate per-document is a natural and cheap adaptation
 
-| Property | delta (x - x0) | EMA |
-|----------|---------------|-----|
-| What it encodes | Total accumulated change | Trajectory / direction |
-| Temporal structure | None — all loops equal | Yes — recency weighted |
-| Per-dimension learning | No | Yes (per-dim alpha) |
-| Conceptual fit | "How far have we come?" | "Where are we going?" |
+**Variant 3: SSM + attention pooling (`HYPERNET_VARIANT=ssm`)**
+- Learned attention query pools over T positions → rank-r SSM input
+- Content-dependent forget/update gates (dt, B, C projected from input)
+- Unlike EMA's fixed alpha, the transition depends on what the content looks like
+- ~27K extra params at rank=32, d_state=16
 
-**Status:** 🔄 Running back-to-back on 1×A100 (300 steps each). Looking for >0.01 BPB below the 1.8140 no-hypernet baseline.
+| Property | Delta | EMA | SSM |
+|----------|-------|-----|-----|
+| Pooling | Learned (attn) | Learned (attn) | Learned (attn) |
+| Cross-loop memory | None | Yes (per-dim EMA) | Yes (content-dependent) |
+| What it reads | x - x0 | x | x |
+| Temporal structure | None | Fixed decay | Content-dependent |
+| Conceptual fit | "What changed?" | "Where are we going?" | "What should I remember?" |
+
+### A100 Hypernetwork Ablation (running)
+
+**Setup:** 1×A100 SXM 80GB, dim=768, batch=131k, lr=0.10, 300 steps each. All with table-stakes (BigramHash, WD, OrthoInit, SmearGate).
+
+| Run | `HYPERNET_VARIANT` | `RUN_ID` | Status |
+|-----|-------------------|----------|--------|
+| Baseline (no hypernet) | (none) | `no_hyper_tablestakes` | ✅ Done: **1.8140** @ step 300 |
+| .mean() hypernet | `coarse` (old code) | `hyper_coarse_tablestakes` | ✅ Done: 1.8188 (no gain) |
+| Delta + attn pool | `coarse` | `hyper_delta` | 🔄 Running |
+| EMA + attn pool | `ema` | `hyper_ema` | ⏳ Queued |
+| SSM + attn pool | `ssm` | `hyper_ssm` | ⏳ Queued |
+
+**Success criteria:** Any variant achieves val_bpb at step 300 that is >0.01 below the 1.8140 baseline. If multiple win, run a longer 1000-step comparison.
 
 ---
 
