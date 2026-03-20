@@ -754,6 +754,34 @@ class HypernetEMA(nn.Module):
         delta = self.up(F.silu(self.down(new_ema)))           # [B, D]
         return new_ema.detach(), delta.unsqueeze(1)           # detach stops grad through history
 
+class HypernetSSM(nn.Module):
+    """Content-dependent recurrence across loops via minimal SSM.
+    Unlike EMA's fixed alpha, the forget/update rates depend on what the residual stream contains."""
+    def __init__(self, dim: int, d_state: int = 16, rank: int = 32, stride: int = 4):
+        super().__init__()
+        self.stride = stride
+        self.rank = rank
+        self.d_state = d_state
+        self.in_proj = CastedLinear(dim, rank, bias=False)
+        self.A_log = nn.Parameter(torch.log(torch.arange(1, d_state + 1).float()).unsqueeze(0).expand(rank, -1))
+        self.BC_proj = CastedLinear(rank, 2 * d_state, bias=False)
+        self.dt_proj = CastedLinear(rank, rank, bias=True)
+        self.out_proj = CastedLinear(rank, dim, bias=False)
+        self.out_proj._zero_init = True
+    def forward(self, h: Tensor, x: Tensor) -> tuple[Tensor, Tensor]:
+        coarse = x[:, ::self.stride, :].mean(dim=1)
+        u = self.in_proj(coarse)
+        BC = self.BC_proj(u)
+        B, C = BC.chunk(2, dim=-1)
+        dt = F.softplus(self.dt_proj(u))
+        A = -torch.exp(self.A_log.to(dtype=u.dtype))
+        dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0))
+        dB = dt.unsqueeze(-1) * B.unsqueeze(1)
+        new_h = h * dA + dB * u.unsqueeze(-1)
+        y = (new_h * C.unsqueeze(1)).sum(-1)
+        delta = self.out_proj(y)
+        return new_h.detach(), delta.unsqueeze(1)
+
 class SmearGate(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -960,6 +988,8 @@ class LoopedGPT(nn.Module):
             self.hypernet = HypernetCoarse(model_dim, hypernet_rank, hypernet_stride)
         elif hypernet_variant == "ema":
             self.hypernet = HypernetEMA(model_dim, hypernet_rank, hypernet_stride)
+        elif hypernet_variant == "ssm":
+            self.hypernet = HypernetSSM(model_dim, d_state=16, rank=hypernet_rank, stride=hypernet_stride)
         self._init_weights(tied_embed_init_std)
 
     def _init_weights(self, std: float) -> None:
@@ -995,7 +1025,7 @@ class LoopedGPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        ema = None
+        h_state = None
         if self.mhc_streams == 4:
             B, T, D = x.shape
             x_s = x.unsqueeze(2).expand(B, T, 4, D)
@@ -1006,9 +1036,11 @@ class LoopedGPT(nn.Module):
                 if isinstance(self.hypernet, HypernetCoarse):
                     x_mixed = self.mhc[0].mix_to_one(x_s) if loop_idx > 0 else x
                     hyper_delta = self.hypernet(x_mixed, x0)
-                elif isinstance(self.hypernet, HypernetEMA):
+                elif isinstance(self.hypernet, (HypernetEMA, HypernetSSM)):
                     x_mixed = self.mhc[0].mix_to_one(x_s) if loop_idx > 0 else x
-                    ema, hyper_delta = self.hypernet(ema if ema is not None else torch.zeros(B, D, device=x.device, dtype=x.dtype), x_mixed)
+                    if h_state is None:
+                        h_state = torch.zeros(B, self.hypernet.rank, self.hypernet.d_state, device=x.device, dtype=x.dtype) if isinstance(self.hypernet, HypernetSSM) else torch.zeros(B, D, device=x.device, dtype=x.dtype)
+                    h_state, hyper_delta = self.hypernet(h_state, x_mixed)
                 for bi, block in enumerate(self.blocks):
                     x_in = self.mhc[bi].mix_to_one(x_s) + ls
                     qd, vd = self._get_deltas(loop_idx, bi, hyper_delta)
@@ -1021,9 +1053,11 @@ class LoopedGPT(nn.Module):
                 hyper_delta = None
                 if isinstance(self.hypernet, HypernetCoarse):
                     hyper_delta = self.hypernet(x, x0)
-                elif isinstance(self.hypernet, HypernetEMA):
+                elif isinstance(self.hypernet, (HypernetEMA, HypernetSSM)):
                     B, T, D = x.shape
-                    ema, hyper_delta = self.hypernet(ema if ema is not None else torch.zeros(B, D, device=x.device, dtype=x.dtype), x)
+                    if h_state is None:
+                        h_state = torch.zeros(B, self.hypernet.rank, self.hypernet.d_state, device=x.device, dtype=x.dtype) if isinstance(self.hypernet, HypernetSSM) else torch.zeros(B, D, device=x.device, dtype=x.dtype)
+                    h_state, hyper_delta = self.hypernet(h_state, x)
                 for bi, block in enumerate(self.blocks):
                     x_in = x + ls
                     qd, vd = self._get_deltas(loop_idx, bi, hyper_delta)
