@@ -1,6 +1,5 @@
 #!/bin/bash
-# A100 Hypernetwork Ablation + Table-Stakes Validation
-# Run on a single A100 80GB on RunPod
+# A100 Hypernetwork Ablation: delta-from-origin vs EMA
 #
 # Prerequisites:
 #   cd /workspace/parameter-golf && git pull
@@ -18,15 +17,7 @@ MAX_WALLCLOCK_SECONDS=0 WARMUP_STEPS=20 \
 WANDB_PROJECT=parameter-golf"
 
 echo "=========================================="
-echo "Run 1/3: No hypernetwork (table-stakes baseline)"
-echo "=========================================="
-env $COMMON \
-  RUN_ID=no_hyper_tablestakes SEED=1337 \
-  torchrun --standalone --nproc_per_node=1 train_gpt.py
-
-echo ""
-echo "=========================================="
-echo "Run 2/3: Hypernetwork coarse (delta-from-origin)"
+echo "Run 1/2: Hypernetwork coarse (delta-from-origin)"
 echo "=========================================="
 env $COMMON \
   HYPERNET_VARIANT=coarse \
@@ -35,7 +26,7 @@ env $COMMON \
 
 echo ""
 echo "=========================================="
-echo "Run 3/3: Hypernetwork EMA (trajectory across loops)"
+echo "Run 2/2: Hypernetwork EMA (trajectory across loops)"
 echo "=========================================="
 env $COMMON \
   HYPERNET_VARIANT=ema \
@@ -44,5 +35,6 @@ env $COMMON \
 
 echo ""
 echo "=========================================="
-echo "All 3 runs complete. Compare val_bpb at steps 100/200/300."
+echo "Both runs complete. Compare val_bpb at steps 100/200/300"
+echo "against no_hyper_tablestakes baseline (1.8140 @ step 300)."
 echo "=========================================="
