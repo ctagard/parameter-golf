@@ -209,15 +209,17 @@ All variants now use `_AttnPool`: a learned query that attends over T positions 
 
 **Setup:** 1×A100 SXM 80GB, dim=768, batch=131k, lr=0.10, 300 steps each. All with table-stakes (BigramHash, WD, OrthoInit, SmearGate).
 
-| Run | `HYPERNET_VARIANT` | `RUN_ID` | Status |
-|-----|-------------------|----------|--------|
-| Baseline (no hypernet) | (none) | `no_hyper_tablestakes` | ✅ Done: **1.8140** @ step 300 |
-| .mean() hypernet | `coarse` (old code) | `hyper_coarse_tablestakes` | ✅ Done: 1.8188 (no gain) |
-| Delta + attn pool | `coarse` | `hyper_delta` | 🔄 Running |
-| EMA + attn pool | `ema` | `hyper_ema` | ⏳ Queued |
-| SSM + attn pool | `ssm` | `hyper_ssm` | ⏳ Queued |
+| Config | Step 100 | Step 200 | Step 300 | int8 roundtrip | ms/step |
+|--------|----------|----------|----------|---------------|---------|
+| **No hypernet** | **2.1432** | **1.9131** | **1.8140** | **1.8197** | 744 |
+| .mean() hypernet | 2.1340 | 1.9124 | 1.8188 | 1.8242 | 755 |
+| Delta + attn pool | 2.1448 | 1.9231 | 1.8303 | 1.8358 | 767 |
+| EMA + attn pool | 2.1488 | 1.9225 | 1.8311 | 1.8365 | 764 |
+| SSM + attn pool | 2.1576 | 1.9451 | 1.8618 | 1.8668 | 767 |
 
-**Success criteria:** Any variant achieves val_bpb at step 300 that is >0.01 below the 1.8140 baseline. If multiple win, run a longer 1000-step comparison.
+**Result: All hypernetwork variants are worse than no hypernet.** SSM is the worst (0.048 BPB degradation). The simpler variants (delta, EMA) are less bad but still negative. The ~3% speed overhead is negligible — the problem is that the extra parameters dilute the optimizer at 300 steps.
+
+**Decision: Drop all hypernetworks from the submission.** The base architecture is already strong. Focus on scaling up training (more steps, larger batch, int6+zstd for artifact headroom).
 
 ---
 
@@ -248,8 +250,7 @@ All variants now use `_AttnPool`: a learned query that attends over T positions 
 | AdamW WD 0.04 | ✅ Table-stakes | Smaller weights → better quantization |
 | Int6+zstd | ✅ Implemented, not yet tested | ~35% smaller artifacts |
 | SWA | ✅ Implemented, not yet tested | Better generalization in warmdown |
-| Hypernetwork (delta) | 🔄 Running on A100 | Content-aware loop conditioning |
-| Hypernetwork (EMA) | 🔄 Running on A100 | Trajectory-aware loop conditioning |
+| Hypernetwork (delta/EMA/SSM) | ❌ Dropped | All variants worse than no hypernet |
 | MPK multi-scale | ❌ Dropped | Too slow — 2.3× wall time for worse BPB |
 
 ---
@@ -275,4 +276,5 @@ All variants now use `_AttnPool`: a learned query that attends over T positions 
 6. **Batch size matters enormously** — 32k beats 8k by 0.22 BPB
 7. **LR scales with batch** — lr=0.08-0.10 at batch=131k+
 8. **Table-stakes mods give ~0.04 BPB** — SmearGate + BigramHash + OrthoInit + WD
-9. **Hypernetwork with .mean() doesn't help** — need to read structure, not averages
+9. **Hypernetworks don't help at 300 steps** — tested .mean(), delta-from-origin, EMA, SSM+attention pooling. All variants worse than no hypernet. Extra params dilute optimizer at this training scale.
+10. **Simpler is better** — every "clever" addition (MPK, hypernetworks) hurt. The winning recipe is clean depth recurrence + LoRA + mHC + table-stakes.
