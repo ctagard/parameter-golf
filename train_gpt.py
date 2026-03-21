@@ -113,9 +113,9 @@ class Hyperparameters:
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # 0=standard eval, 64=sliding window
     quant_bits = int(os.environ.get("QUANT_BITS", 8))
-    hypernet_variant = os.environ.get("HYPERNET_VARIANT", "").strip().lower()  # "", "coarse", "ema"
-    hypernet_rank = int(os.environ.get("HYPERNET_RANK", 32))
-    hypernet_stride = int(os.environ.get("HYPERNET_STRIDE", 4))
+    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 0))  # 0=disabled, 4=recommended
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.03))
+    ttt_steps = int(os.environ.get("TTT_STEPS", 3))
 
 # MUON OPTIMIZER
 # 
@@ -306,6 +306,102 @@ def eval_val(
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
+
+def eval_val_sliding(args, model, rank, world_size, device, val_tokens,
+                     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut):
+    """Sliding window eval with stride. Each scored token gets near-full context."""
+    base_model = model.module if hasattr(model, 'module') else model
+    base_model.eval()
+    stride = args.eval_stride
+    seq_len = args.train_seq_len
+    total = val_tokens.numel() - 1
+    loss_sum = 0.0
+    byte_sum = 0.0
+    token_count = 0
+    for start in range(rank * stride, total - seq_len, stride * world_size):
+        if start + seq_len >= val_tokens.numel():
+            break
+        chunk = val_tokens[start:start + seq_len + 1].to(dtype=torch.int64, device=device)
+        x, y = chunk[:-1].unsqueeze(0), chunk[1:].unsqueeze(0)
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = base_model.forward_logits(x)
+        # Score only the last `stride` tokens (where context is richest)
+        score_start = seq_len - stride
+        scored_logits = logits[0, score_start:].float()
+        scored_targets = y[0, score_start:]
+        per_tok_loss = F.cross_entropy(scored_logits, scored_targets, reduction='none')
+        loss_sum += per_tok_loss.sum().item()
+        token_count += stride
+        prev_ids = chunk[score_start:seq_len].cpu().numpy()
+        tgt_ids = chunk[score_start + 1:seq_len + 1].cpu().numpy()
+        byte_sum += float(base_bytes_lut[tgt_ids].sum() +
+                         (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).sum())
+    if dist.is_available() and dist.is_initialized():
+        t = torch.tensor([loss_sum, byte_sum, float(token_count)], device=device)
+        dist.all_reduce(t)
+        loss_sum, byte_sum, token_count = t[0].item(), t[1].item(), int(t[2].item())
+    val_loss = loss_sum / max(token_count, 1)
+    val_bpb = (loss_sum / math.log(2.0)) / max(byte_sum, 1.0)
+    base_model.train()
+    return val_loss, val_bpb
+
+
+def eval_val_ttt(args, model, rank, world_size, device, val_tokens,
+                 base_bytes_lut, has_leading_space_lut, is_boundary_token_lut):
+    """Test-time training: adapt small LoRA on lm_head per document chunk before scoring."""
+    torch._dynamo.reset()
+    base_model = model.module if hasattr(model, 'module') else model
+    base_model.eval()
+    ttt_rank = args.ttt_lora_rank
+    ttt_steps = args.ttt_steps
+    seq_len = args.train_seq_len
+    total = val_tokens.numel() - 1
+    dim = base_model.tok_emb.embedding_dim
+    vocab = base_model.tok_emb.num_embeddings
+    loss_sum = 0.0
+    byte_sum = 0.0
+    token_count = 0
+    for doc_start in range(rank * seq_len, total - seq_len, seq_len * world_size):
+        if doc_start + seq_len >= val_tokens.numel():
+            break
+        chunk = val_tokens[doc_start:doc_start + seq_len + 1].to(dtype=torch.int64, device=device)
+        x, y = chunk[:-1].unsqueeze(0), chunk[1:].unsqueeze(0)
+        # Create per-document LoRA: hidden → rank → vocab
+        lora_A = torch.randn(dim, ttt_rank, device=device, dtype=torch.float32) * 0.01
+        lora_B = torch.zeros(ttt_rank, vocab, device=device, dtype=torch.float32)
+        lora_A.requires_grad_(True)
+        lora_B.requires_grad_(True)
+        opt = torch.optim.SGD([lora_A, lora_B], lr=args.ttt_lora_lr)
+        # Train LoRA for a few steps on this document
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            hidden = base_model.encode(x)  # [1, T, D] — frozen
+        for _ in range(ttt_steps):
+            opt.zero_grad()
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = base_model.decode(hidden) + (hidden @ lora_A.to(hidden.dtype)) @ lora_B.to(hidden.dtype)
+            loss = F.cross_entropy(logits.float().reshape(-1, vocab), y.reshape(-1))
+            loss.backward()
+            opt.step()
+        # Score with adapted model
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits = base_model.decode(hidden) + (hidden @ lora_A.to(hidden.dtype)) @ lora_B.to(hidden.dtype)
+        per_tok_loss = F.cross_entropy(logits.float().reshape(-1, vocab), y.reshape(-1), reduction='none')
+        loss_sum += per_tok_loss.sum().item()
+        token_count += seq_len
+        prev_ids = x[0].cpu().numpy()
+        tgt_ids = y[0].cpu().numpy()
+        byte_sum += float(base_bytes_lut[tgt_ids].sum() +
+                         (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).sum())
+    if dist.is_available() and dist.is_initialized():
+        t = torch.tensor([loss_sum, byte_sum, float(token_count)], device=device)
+        dist.all_reduce(t)
+        loss_sum, byte_sum, token_count = t[0].item(), t[1].item(), int(t[2].item())
+    val_loss = loss_sum / max(token_count, 1)
+    val_bpb = (loss_sum / math.log(2.0)) / max(byte_sum, 1.0)
+    base_model.train()
+    return val_loss, val_bpb
+
+
 # POST-TRAINING QUANTIZATION
 #
 # It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
@@ -316,7 +412,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,loop_emb,alpha_res,alpha_pre,alpha_post,smear,bigram,hypernet",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,loop_emb,alpha_res,alpha_pre,alpha_post,smear,bigram",
     ).split(",")
     if pattern
 )
@@ -712,72 +808,6 @@ class mHCLite(nn.Module):
         return (H_pre.unsqueeze(-1) * x_streams).sum(dim=2)
 
 
-class _AttnPool(nn.Module):
-    """Learned attention pooling: query attends over T positions → single vector. No .mean()."""
-    def __init__(self, dim: int):
-        super().__init__()
-        self.q = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
-    def forward(self, x: Tensor) -> Tensor:
-        w = torch.softmax(self.q @ x.transpose(-2, -1) / x.size(-1)**0.5, dim=-1)  # [B,1,T]
-        return (w @ x).squeeze(1)  # [B, D]
-
-class HypernetCoarse(nn.Module):
-    """Delta-from-origin + attention pooling → rank-r → Q delta."""
-    def __init__(self, dim: int, rank: int = 32, stride: int = 4):
-        super().__init__()
-        self.pool = _AttnPool(dim)
-        self.down = CastedLinear(dim, rank, bias=False)
-        self.up = CastedLinear(rank, dim, bias=False)
-        self.up._zero_init = True
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        context = self.pool(x - x0)  # [B, D] — learned pooling over what loops changed
-        return self.up(F.silu(self.down(context))).unsqueeze(1)
-
-class HypernetEMA(nn.Module):
-    """EMA trajectory + attention pooling across loops. Per-dim learned decay."""
-    def __init__(self, dim: int, rank: int = 32, stride: int = 4):
-        super().__init__()
-        self.pool = _AttnPool(dim)
-        self.rank = rank  # needed for h_state init check
-        self.alpha_logit = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
-        self.down = CastedLinear(dim, rank, bias=False)
-        self.up = CastedLinear(rank, dim, bias=False)
-        self.up._zero_init = True
-    def forward(self, ema: Tensor, x: Tensor) -> tuple[Tensor, Tensor]:
-        alpha = torch.sigmoid(self.alpha_logit).to(dtype=x.dtype)
-        pooled = self.pool(x)  # [B, D] — learned pooling, not mean
-        new_ema = alpha * ema + (1 - alpha) * pooled
-        delta = self.up(F.silu(self.down(new_ema)))
-        return new_ema.detach(), delta.unsqueeze(1)
-
-class HypernetSSM(nn.Module):
-    """SSM + attention pooling across loops. Learns which tokens matter (no .mean())."""
-    def __init__(self, dim: int, d_state: int = 16, rank: int = 32, stride: int = 4):
-        super().__init__()
-        self.rank = rank
-        self.d_state = d_state
-        self.in_proj = CastedLinear(dim, rank, bias=False)
-        self.pool_q = nn.Parameter(torch.randn(1, 1, rank) * 0.02)  # learned pooling query
-        self.A_log = nn.Parameter(torch.log(torch.arange(1, d_state + 1).float()).unsqueeze(0).expand(rank, -1))
-        self.BC_proj = CastedLinear(rank, 2 * d_state, bias=False)
-        self.dt_proj = CastedLinear(rank, rank, bias=True)
-        self.out_proj = CastedLinear(rank, dim, bias=False)
-        self.out_proj._zero_init = True
-    def forward(self, h: Tensor, x: Tensor) -> tuple[Tensor, Tensor]:
-        u = self.in_proj(x)                                          # [B, T, rank]
-        pool_w = torch.softmax(self.pool_q @ u.transpose(-2, -1), dim=-1)  # [B, 1, T]
-        u_pooled = (pool_w @ u).squeeze(1)                           # [B, rank]
-        BC = self.BC_proj(u_pooled)
-        B_gate, C_gate = BC.chunk(2, dim=-1)
-        dt = F.softplus(self.dt_proj(u_pooled))
-        A = -torch.exp(self.A_log.to(dtype=u_pooled.dtype))
-        dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0))
-        dB = dt.unsqueeze(-1) * B_gate.unsqueeze(1)
-        new_h = h * dA + dB * u_pooled.unsqueeze(-1)
-        y = (new_h * C_gate.unsqueeze(1)).sum(-1)
-        delta = self.out_proj(y)
-        return new_h.detach(), delta.unsqueeze(1)
-
 class SmearGate(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -952,8 +982,7 @@ class LoopedGPT(nn.Module):
                  num_heads: int, num_kv_heads: int, mlp_mult: float, lora_rank: int, mhc_streams: int,
                  tie_embeddings: bool, tied_embed_init_std: float, logit_softcap: float,
                  rope_base: float, qk_gain_init: float, mlp_type: str = "relu2",
-                 bigram_vocab_size: int = 0, bigram_dim: int = 128,
-                 hypernet_variant: str = "", hypernet_rank: int = 32, hypernet_stride: int = 4):
+                 bigram_vocab_size: int = 0, bigram_dim: int = 128):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -961,7 +990,6 @@ class LoopedGPT(nn.Module):
         self.num_loops = num_loops
         self.lora_rank = lora_rank
         self.mhc_streams = mhc_streams
-        self.hypernet_variant = hypernet_variant
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.smear = SmearGate(model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
@@ -978,14 +1006,6 @@ class LoopedGPT(nn.Module):
             self.loop_lora_v = nn.ModuleList([nn.ModuleList([LoRAAdapter(model_dim, kv_dim, lora_rank) for _ in range(num_unique_blocks)]) for _ in range(num_loops)])
         if mhc_streams == 4:
             self.mhc = nn.ModuleList([mHCLite(model_dim, 4) for _ in range(num_unique_blocks)])
-        # Hypernetwork: dynamic loop conditioning from residual state
-        self.hypernet: nn.Module | None = None
-        if hypernet_variant == "coarse":
-            self.hypernet = HypernetCoarse(model_dim, hypernet_rank, hypernet_stride)
-        elif hypernet_variant == "ema":
-            self.hypernet = HypernetEMA(model_dim, hypernet_rank, hypernet_stride)
-        elif hypernet_variant == "ssm":
-            self.hypernet = HypernetSSM(model_dim, d_state=16, rank=hypernet_rank, stride=hypernet_stride)
         self._init_weights(tied_embed_init_std)
 
     def _init_weights(self, std: float) -> None:
@@ -1002,68 +1022,50 @@ class LoopedGPT(nn.Module):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
-    def _get_deltas(self, loop_idx: int, bi: int, hyper_delta: Tensor | None):
-        """Build q_delta_fn and v_delta_fn combining LoRA + hypernetwork."""
-        lora_q = self.loop_lora_q[loop_idx][bi] if self.lora_rank > 0 else None
-        lora_v = self.loop_lora_v[loop_idx][bi] if self.lora_rank > 0 else None
-        if hyper_delta is not None and lora_q is not None:
-            qd = lambda n, lq=lora_q, hd=hyper_delta: lq(n) + hd
-        elif hyper_delta is not None:
-            qd = lambda n, hd=hyper_delta: hd.expand_as(n)
-        else:
-            qd = lora_q
-        return qd, lora_v
-
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def encode(self, input_ids: Tensor) -> Tensor:
+        """Return final hidden states [B, T, D] before logit projection."""
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
-        h_state = None
         if self.mhc_streams == 4:
             B, T, D = x.shape
             x_s = x.unsqueeze(2).expand(B, T, 4, D)
             for loop_idx in range(self.num_loops):
                 ls = self.loop_emb[loop_idx].to(x.dtype)
-                # Hypernetwork conditioning
-                hyper_delta = None
-                if isinstance(self.hypernet, HypernetCoarse):
-                    x_mixed = self.mhc[0].mix_to_one(x_s) if loop_idx > 0 else x
-                    hyper_delta = self.hypernet(x_mixed, x0)
-                elif isinstance(self.hypernet, (HypernetEMA, HypernetSSM)):
-                    x_mixed = self.mhc[0].mix_to_one(x_s) if loop_idx > 0 else x
-                    if h_state is None:
-                        h_state = torch.zeros(B, self.hypernet.rank, self.hypernet.d_state, device=x.device, dtype=x.dtype) if isinstance(self.hypernet, HypernetSSM) else torch.zeros(B, D, device=x.device, dtype=x.dtype)
-                    h_state, hyper_delta = self.hypernet(h_state, x_mixed)
                 for bi, block in enumerate(self.blocks):
                     x_in = self.mhc[bi].mix_to_one(x_s) + ls
-                    qd, vd = self._get_deltas(loop_idx, bi, hyper_delta)
+                    qd = self.loop_lora_q[loop_idx][bi] if self.lora_rank > 0 else None
+                    vd = self.loop_lora_v[loop_idx][bi] if self.lora_rank > 0 else None
                     block_out = block(x_in, x0, qd, vd)
                     x_s = self.mhc[bi](x_s, block_out)
             x = x_s.mean(dim=2)
         else:
             for loop_idx in range(self.num_loops):
                 ls = self.loop_emb[loop_idx].to(x.dtype)
-                hyper_delta = None
-                if isinstance(self.hypernet, HypernetCoarse):
-                    hyper_delta = self.hypernet(x, x0)
-                elif isinstance(self.hypernet, (HypernetEMA, HypernetSSM)):
-                    B, T, D = x.shape
-                    if h_state is None:
-                        h_state = torch.zeros(B, self.hypernet.rank, self.hypernet.d_state, device=x.device, dtype=x.dtype) if isinstance(self.hypernet, HypernetSSM) else torch.zeros(B, D, device=x.device, dtype=x.dtype)
-                    h_state, hyper_delta = self.hypernet(h_state, x)
                 for bi, block in enumerate(self.blocks):
                     x_in = x + ls
-                    qd, vd = self._get_deltas(loop_idx, bi, hyper_delta)
+                    qd = self.loop_lora_q[loop_idx][bi] if self.lora_rank > 0 else None
+                    vd = self.loop_lora_v[loop_idx][bi] if self.lora_rank > 0 else None
                     x = block(x_in, x0, qd, vd)
-        x = self.final_norm(x)
+        return self.final_norm(x)
+
+    def decode(self, x: Tensor) -> Tensor:
+        """Hidden states → softcapped logits [B, T, V]."""
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
         else:
             logits = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        """Forward returning logits [B, T, V] for sliding window / TTT eval."""
+        return self.decode(self.encode(input_ids))
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self.forward_logits(input_ids)
         return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), target_ids.reshape(-1), reduction="mean")
 
 def build_model(args: Hyperparameters) -> nn.Module:
@@ -1076,9 +1078,7 @@ def build_model(args: Hyperparameters) -> nn.Module:
         return GPT(num_layers=args.num_layers, **common)
     if args.model_family == "looped":
         return LoopedGPT(num_unique_blocks=args.num_unique_blocks, num_loops=args.num_loops,
-                         lora_rank=args.lora_rank, mhc_streams=args.mhc_streams,
-                         hypernet_variant=args.hypernet_variant, hypernet_rank=args.hypernet_rank,
-                         hypernet_stride=args.hypernet_stride, **common)
+                         lora_rank=args.lora_rank, mhc_streams=args.mhc_streams, **common)
     raise ValueError(f"Unknown MODEL_FAMILY={args.model_family!r}")
 
 def split_model_params(model: nn.Module) -> tuple[Tensor, list[Tensor], list[Tensor], list[Tensor]]:
@@ -1484,6 +1484,13 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    eval_luts = (val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut)
+    if args.eval_stride > 0:
+        sw_loss, sw_bpb = eval_val_sliding(args, model, rank, world_size, device, *eval_luts)
+        log0(f"sliding_window_eval stride:{args.eval_stride} val_loss:{sw_loss:.4f} val_bpb:{sw_bpb:.4f}")
+    if args.ttt_lora_rank > 0:
+        ttt_loss, ttt_bpb = eval_val_ttt(args, model, rank, world_size, device, *eval_luts)
+        log0(f"ttt_eval rank:{args.ttt_lora_rank} steps:{args.ttt_steps} val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f}")
 
     if distributed:
         dist.destroy_process_group()
