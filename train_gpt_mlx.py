@@ -644,13 +644,14 @@ class LoopedGPT(BaseModel):
                        for _ in range(num_unique_blocks)]
         self._zero_init_proj(self.blocks)
         self.loop_emb = mx.zeros((num_loops, dim), dtype=mx.float32)
-        # Per-loop LoRA adapters on Q and V
+        # Per-loop LoRA: store A/B as stacked tensors so MLX tracks them
         if lora_rank > 0:
             kv_dim = num_kv_heads * (dim // num_heads)
-            self.loop_lora_q = [[LoRAAdapter(dim, dim, lora_rank) for _ in range(num_unique_blocks)]
-                                for _ in range(num_loops)]
-            self.loop_lora_v = [[LoRAAdapter(dim, kv_dim, lora_rank) for _ in range(num_unique_blocks)]
-                                for _ in range(num_loops)]
+            n = num_loops * num_unique_blocks
+            self.lora_q_A = mx.random.normal((n, dim, lora_rank)) * 0.01
+            self.lora_q_B = mx.zeros((n, lora_rank, dim))
+            self.lora_v_A = mx.random.normal((n, dim, lora_rank)) * 0.01
+            self.lora_v_B = mx.zeros((n, lora_rank, kv_dim))
 
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
@@ -662,8 +663,14 @@ class LoopedGPT(BaseModel):
             loop_signal = self.loop_emb[loop_idx].astype(x.dtype)
             for block_idx, block in enumerate(self.blocks):
                 x_in = x + loop_signal[None, None, :]
-                qd = self.loop_lora_q[loop_idx][block_idx] if self.lora_rank > 0 else None
-                vd = self.loop_lora_v[loop_idx][block_idx] if self.lora_rank > 0 else None
+                if self.lora_rank > 0:
+                    li = loop_idx * self.num_unique_blocks + block_idx
+                    qA, qB = self.lora_q_A[li].astype(x.dtype), self.lora_q_B[li].astype(x.dtype)
+                    vA, vB = self.lora_v_A[li].astype(x.dtype), self.lora_v_B[li].astype(x.dtype)
+                    qd = lambda n, a=qA, b=qB: (n @ a) @ b
+                    vd = lambda n, a=vA, b=vB: (n @ a) @ b
+                else:
+                    qd, vd = None, None
                 x = block(x_in, x0, qd, vd)
         return self.final_norm(x)
 
