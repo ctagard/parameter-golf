@@ -756,10 +756,11 @@ def make_mlp(dim: int, mlp_mult: int, mlp_type: str = "relu2") -> nn.Module:
 class LoRAAdapter(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, rank: int):
         super().__init__()
+        self.scale = float(rank ** 0.5) / rank  # alpha=sqrt(rank), scale=1/sqrt(rank)
         self.A = nn.Parameter(torch.randn(in_dim, rank) * 0.01)
         self.B = nn.Parameter(torch.zeros(rank, out_dim))
     def forward(self, x: Tensor) -> Tensor:
-        return (x @ self.A.to(x.dtype)) @ self.B.to(x.dtype)
+        return ((x @ self.A.to(x.dtype)) @ self.B.to(x.dtype)) * self.scale
 
 def _build_perm_matrices(n: int) -> Tensor:
     from itertools import permutations

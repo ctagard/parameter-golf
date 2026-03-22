@@ -406,14 +406,16 @@ class Block(nn.Module):
 
 
 class LoRAAdapter(nn.Module):
-    """Low-rank adapter: output = x @ A @ B, initialized near zero."""
+    """Low-rank adapter: output = (x @ A @ B) * scale. Alpha scaling prevents
+    large adapter output when B first activates from zero."""
     def __init__(self, in_dim: int, out_dim: int, rank: int):
         super().__init__()
+        self.scale = float(rank ** 0.5) / rank  # alpha=sqrt(rank), scale=1/sqrt(rank)
         self.A = mx.random.normal((in_dim, rank), dtype=mx.float32) * 0.01
         self.B = mx.zeros((rank, out_dim), dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return (x @ self.A.astype(x.dtype)) @ self.B.astype(x.dtype)
+        return ((x @ self.A.astype(x.dtype)) @ self.B.astype(x.dtype)) * self.scale
 
 
 class SmearGate(nn.Module):
