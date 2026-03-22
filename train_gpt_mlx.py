@@ -86,6 +86,7 @@ class Hyperparameters:
     num_unique_blocks: int = int(os.environ.get("NUM_UNIQUE_BLOCKS", 3))
     num_loops: int = int(os.environ.get("NUM_LOOPS", 3))
     lora_rank: int = int(os.environ.get("LORA_RANK", 0))  # 0 = no per-loop LoRA
+    ortho_lora: bool = bool(int(os.environ.get("ORTHO_LORA", "0")))  # SVD-based orthogonal init
     mhc_streams: int = int(os.environ.get("MHC_STREAMS", 0))  # 0 = disabled, 4 = mHC-Lite with 4 streams
     bigram_vocab_size: int = int(os.environ.get("BIGRAM_VOCAB_SIZE", 0))  # 0=disabled, 4096=recommended
     bigram_dim: int = int(os.environ.get("BIGRAM_DIM", 128))
@@ -633,7 +634,7 @@ class LoopedGPT(BaseModel):
                  num_heads: int, num_kv_heads: int, mlp_mult: int, lora_rank: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float,
                  tied_embed_init_std: float, qk_gain_init: float, mlp_type: str = "relu2",
-                 bigram_vocab_size: int = 0, bigram_dim: int = 128):
+                 bigram_vocab_size: int = 0, bigram_dim: int = 128, ortho_lora: bool = False):
         super().__init__(vocab_size, dim, logit_chunk_tokens, logit_softcap, tied_embed_init_std)
         self.num_unique_blocks = num_unique_blocks
         self.num_loops = num_loops
@@ -647,9 +648,34 @@ class LoopedGPT(BaseModel):
         # Per-loop LoRA: named attributes so MLX parameter traversal finds them
         if lora_rank > 0:
             kv_dim = num_kv_heads * (dim // num_heads)
-            for i in range(num_loops * num_unique_blocks):
-                setattr(self, f"lora_q_{i}", LoRAAdapter(dim, dim, lora_rank))
-                setattr(self, f"lora_v_{i}", LoRAAdapter(dim, kv_dim, lora_rank))
+            n = num_loops * num_unique_blocks
+            if ortho_lora:
+                # SVD-based init: partition base weight's tail singular vectors across adapters
+                for bi in range(num_unique_blocks):
+                    q_A_mats = self._ortho_lora_init(self.blocks[bi].attn.c_q.weight, n_adapters=num_loops, rank=lora_rank)
+                    v_A_mats = self._ortho_lora_init(self.blocks[bi].attn.c_v.weight, n_adapters=num_loops, rank=lora_rank)
+                    for li in range(num_loops):
+                        idx = li * num_unique_blocks + bi
+                        lora_q = LoRAAdapter(dim, dim, lora_rank)
+                        lora_q.A = q_A_mats[li]
+                        lora_v = LoRAAdapter(dim, kv_dim, lora_rank)
+                        lora_v.A = v_A_mats[li]
+                        setattr(self, f"lora_q_{idx}", lora_q)
+                        setattr(self, f"lora_v_{idx}", lora_v)
+            else:
+                for i in range(n):
+                    setattr(self, f"lora_q_{i}", LoRAAdapter(dim, dim, lora_rank))
+                    setattr(self, f"lora_v_{i}", LoRAAdapter(dim, kv_dim, lora_rank))
+
+    @staticmethod
+    def _ortho_lora_init(weight: mx.array, n_adapters: int, rank: int) -> list[mx.array]:
+        """Partition base weight's tail right-singular vectors across adapters."""
+        w = np.array(weight.astype(mx.float32))
+        _, _, Vh = np.linalg.svd(w, full_matrices=True)
+        n_needed = n_adapters * rank
+        # Tail vectors (smallest singular values) — directions W uses least
+        cols = Vh[-n_needed:].T  # (in_dim, n_needed)
+        return [mx.array(cols[:, i*rank:(i+1)*rank].copy(), dtype=mx.float32) for i in range(n_adapters)]
 
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
@@ -685,7 +711,7 @@ def build_model(args: Hyperparameters) -> nn.Module:
     if args.model_family == "looped":
         return LoopedGPT(num_unique_blocks=args.num_unique_blocks, num_loops=args.num_loops,
                          lora_rank=args.lora_rank, bigram_vocab_size=args.bigram_vocab_size,
-                         bigram_dim=args.bigram_dim, **common)
+                         bigram_dim=args.bigram_dim, ortho_lora=args.ortho_lora, **common)
     raise ValueError(f"Unknown MODEL_FAMILY={args.model_family!r}")
 
 

@@ -152,7 +152,7 @@ def main():
 
     results.append(run_config("diag_no_lora", {"LORA_RANK": "0"}))
     results.append(run_config("diag_lora32", {"LORA_RANK": "32"}))
-    results.append(run_config("diag_lora32_bigram", {"LORA_RANK": "32", "BIGRAM_VOCAB_SIZE": "4096"}))
+    results.append(run_config("diag_lora32_ortho", {"LORA_RANK": "32", "ORTHO_LORA": "1"}))
 
     # Summary
     print("\n" + "=" * 60)
@@ -167,7 +167,7 @@ def main():
 
     # Analyze LoRA weights from the trained models
     analyze_lora_weights("diag_lora32")
-    analyze_lora_weights("diag_lora32_bigram")
+    analyze_lora_weights("diag_lora32_ortho")
 
     # Experiment 2: Ablation (zero out one loop's LoRA)
     # This would require loading model and doing eval — skip for now,
