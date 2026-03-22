@@ -106,6 +106,7 @@ class Hyperparameters:
     mhc_streams = int(os.environ.get("MHC_STREAMS", 0))
     mlp_type = os.environ.get("MLP_TYPE", "relu2").strip().lower()
     wandb_project = os.environ.get("WANDB_PROJECT", "")
+    profile_step = int(os.environ.get("PROFILE_STEP", -1))  # -1=disabled, 0=profile first step after warmup
 
     # Table-stakes modifications.
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 0))  # 0=disabled, 4096=recommended
@@ -197,12 +198,7 @@ class Muon(torch.optim.Optimizer):
                 curr += p.numel()
 
         return loss
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
-#
-# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
-# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
-# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
-# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
+# TOKENIZER-AGNOSTIC EVALUATION SETUP
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -1350,6 +1346,14 @@ def main() -> None:
                 p.requires_grad_(True)
             log0(f"lora_A_unfrozen at step {step}")
         zero_grad_all()
+        # Optional profiling of a single step
+        do_profile = (args.profile_step >= 0 and step == args.profile_step)
+        prof_ctx = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=True, with_stack=True, profile_memory=True,
+        ) if do_profile else None
+        if prof_ctx is not None:
+            prof_ctx.__enter__()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
@@ -1375,6 +1379,12 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        if prof_ctx is not None:
+            torch.cuda.synchronize()
+            prof_ctx.__exit__(None, None, None)
+            prof_ctx.export_chrome_trace("profile_trace.json")
+            log0(prof_ctx.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+            log0("profile_trace saved to profile_trace.json")
 
         if args.swa_enabled and scale < 1.0:
             with torch.no_grad():
