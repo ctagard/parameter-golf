@@ -87,12 +87,8 @@ class Hyperparameters:
     num_loops: int = int(os.environ.get("NUM_LOOPS", 3))
     lora_rank: int = int(os.environ.get("LORA_RANK", 0))  # 0 = no per-loop LoRA
     mhc_streams: int = int(os.environ.get("MHC_STREAMS", 0))  # 0 = disabled, 4 = mHC-Lite with 4 streams
-    # MPK strides. STRIDE_SCHEDULE overrides fixed strides with per-loop (k,m) pairs.
-    # Format: "k1,m1;k2,m2;k3,m3" e.g. "4,8;2,4;1,2" for coarse-to-fine
-    mpk_k_stride: int = int(os.environ.get("MPK_K_STRIDE", 2))
-    mpk_m_stride: int = int(os.environ.get("MPK_M_STRIDE", 4))
-    stride_schedule: str = os.environ.get("STRIDE_SCHEDULE", "")  # e.g. "4,8;2,4;1,2"
-
+    bigram_vocab_size: int = int(os.environ.get("BIGRAM_VOCAB_SIZE", 0))  # 0=disabled, 4096=recommended
+    bigram_dim: int = int(os.environ.get("BIGRAM_DIM", 128))
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
@@ -401,80 +397,6 @@ class Block(nn.Module):
         return x
 
 
-class StreamBlock(nn.Module):
-    """Simplified block without resid_mix/x0 — used by MPK streams."""
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 rope_base: float, qk_gain_init: float, mlp_type: str = "relu2"):
-        super().__init__()
-        self.attn_norm = RMSNormNoWeight()
-        self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = make_mlp(dim, mlp_mult, mlp_type)
-        self.attn_scale = mx.ones((dim,), dtype=mx.float32)
-        self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
-
-
-class MPKBlock(nn.Module):
-    """Multi-Pass Keys block: shared weights at full/medium/coarse resolution, K gates P+M."""
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 rope_base: float, qk_gain_init: float, k_stride: int, m_stride: int,
-                 mlp_type: str = "relu2"):
-        super().__init__()
-        self.k_stride = k_stride
-        self.m_stride = m_stride
-        self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
-        self.shared_stem = CastedLinear(dim, dim)
-        self.shared_stream = StreamBlock(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mlp_type)
-        self.k_to_controls = CastedLinear(dim, 4 * dim)
-        self.fusion_norm = RMSNormNoWeight()
-        self.fusion = CastedLinear(2 * dim, dim)
-        self.fusion_scale = mx.ones((dim,), dtype=mx.float32)
-
-    def __call__(self, x: mx.array, x0: mx.array, k_stride: int = 0, m_stride: int = 0) -> mx.array:
-        ks = k_stride if k_stride > 0 else self.k_stride
-        ms = m_stride if m_stride > 0 else self.m_stride
-        mix = self.resid_mix.astype(x.dtype)
-        base = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        base = self.shared_stem(base)
-        seq_len = base.shape[1]
-
-        # P stream: full resolution (skip if ks==1, P is just the base stream processed)
-        p = self.shared_stream(base)
-
-        # K stream: medium resolution
-        if ks > 1:
-            k_in = base[:, ::ks, :]
-            k_out = self.shared_stream(k_in)
-            k = mx.repeat(k_out, ks, axis=1)[:, :seq_len, :]
-        else:
-            k = p  # at stride 1, K collapses to P
-
-        # M stream: coarse resolution
-        if ms > 1:
-            m_in = base[:, ::ms, :]
-            m_out = self.shared_stream(m_in)
-            m = mx.repeat(m_out, ms, axis=1)[:, :seq_len, :]
-        else:
-            m = p  # at stride 1, M collapses to P
-
-        controls = self.k_to_controls(k)
-        c_size = controls.shape[-1] // 4
-        gate_p = controls[..., :c_size]
-        gate_m = controls[..., c_size:2*c_size]
-        shift_p = controls[..., 2*c_size:3*c_size]
-        shift_m = controls[..., 3*c_size:]
-        p = p * (1.0 + mx.tanh(gate_p)) + shift_p
-        m = m * (1.0 + mx.tanh(gate_m)) + shift_m
-
-        fused = self.fusion(mx.concatenate([p, m], axis=-1))
-        return x + self.fusion_scale.astype(x.dtype)[None, None, :] * self.fusion_norm(fused)
-
 
 class LoRAAdapter(nn.Module):
     """Low-rank adapter: output = x @ A @ B, initialized near zero."""
@@ -485,6 +407,39 @@ class LoRAAdapter(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         return (x @ self.A.astype(x.dtype)) @ self.B.astype(x.dtype)
+
+
+class SmearGate(nn.Module):
+    """Blend each token with previous token via learned per-dim gate."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = mx.zeros((dim,), dtype=mx.float32)
+    def __call__(self, x: mx.array) -> mx.array:
+        g = mx.sigmoid(self.gate).astype(x.dtype)[None, None, :]
+        x_prev = mx.concatenate([mx.zeros_like(x[:, :1]), x[:, :-1]], axis=1)
+        return (1 - g) * x + g * x_prev
+
+
+class BigramHashEmbedding(nn.Module):
+    """Hash bigram pairs into learned embedding table."""
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        self.embed.weight = mx.zeros_like(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            self.proj.weight = mx.zeros_like(self.proj.weight)
+        self.scale = mx.array(0.05, dtype=mx.float32)
+    def __call__(self, token_ids: mx.array) -> mx.array:
+        t = token_ids.astype(mx.int32)
+        mod = self.bigram_vocab_size - 1
+        hashed = mx.concatenate([mx.full(t[:, :1].shape, mod, dtype=mx.int32),
+                                  (36313 * t[:, 1:]) ^ (27191 * t[:, :-1]) % mod], axis=1)
+        h = self.embed(hashed)
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.astype(h.dtype)
 
 
 # ============================================================================
@@ -670,15 +625,17 @@ class LoopedGPT(BaseModel):
     def __init__(self, vocab_size: int, num_unique_blocks: int, num_loops: int, dim: int,
                  num_heads: int, num_kv_heads: int, mlp_mult: int, lora_rank: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float,
-                 tied_embed_init_std: float, qk_gain_init: float, mlp_type: str = "relu2"):
+                 tied_embed_init_std: float, qk_gain_init: float, mlp_type: str = "relu2",
+                 bigram_vocab_size: int = 0, bigram_dim: int = 128):
         super().__init__(vocab_size, dim, logit_chunk_tokens, logit_softcap, tied_embed_init_std)
         self.num_unique_blocks = num_unique_blocks
         self.num_loops = num_loops
         self.lora_rank = lora_rank
+        self.smear = SmearGate(dim)
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, dim) if bigram_vocab_size > 0 else None
         self.blocks = [Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mlp_type)
                        for _ in range(num_unique_blocks)]
         self._zero_init_proj(self.blocks)
-        # Learned loop embeddings
         self.loop_emb = mx.zeros((num_loops, dim), dtype=mx.float32)
         # Per-loop LoRA adapters on Q and V
         if lora_rank > 0:
@@ -689,131 +646,25 @@ class LoopedGPT(BaseModel):
                                 for _ in range(num_loops)]
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids).astype(COMPUTE_DTYPE)
+        x = self.smear(rms_norm(x))
         x0 = x
         for loop_idx in range(self.num_loops):
             loop_signal = self.loop_emb[loop_idx].astype(x.dtype)
             for block_idx, block in enumerate(self.blocks):
                 x_in = x + loop_signal[None, None, :]
                 if self.lora_rank > 0:
-                    # Apply LoRA deltas to attention input before block processes it
                     normed = block.attn_norm(x_in)
-                    q_delta = self.loop_lora_q[loop_idx][block_idx](normed)
-                    v_delta = self.loop_lora_v[loop_idx][block_idx](normed)
-                    # Store deltas for the attention to use — we add directly to q/v projections
-                    block.attn._lora_q_delta = q_delta
-                    block.attn._lora_v_delta = v_delta
+                    block.attn._lora_q_delta = self.loop_lora_q[loop_idx][block_idx](normed)
+                    block.attn._lora_v_delta = self.loop_lora_v[loop_idx][block_idx](normed)
                 x = block(x_in, x0)
                 if self.lora_rank > 0:
                     block.attn._lora_q_delta = None
                     block.attn._lora_v_delta = None
         return self.final_norm(x)
 
-
-class MPKGPT(BaseModel):
-    """Multi-Pass Keys GPT: sequential MPKBlocks without skip connections."""
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int,
-                 mlp_mult: int, logit_chunk_tokens: int, logit_softcap: float, rope_base: float,
-                 tied_embed_init_std: float, qk_gain_init: float, k_stride: int, m_stride: int,
-                 mlp_type: str = "relu2"):
-        super().__init__(vocab_size, dim, logit_chunk_tokens, logit_softcap, tied_embed_init_std)
-        self.blocks = [MPKBlock(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                                k_stride, m_stride, mlp_type)
-                       for _ in range(num_layers)]
-        # Zero-init the fusion and shared_stream projections
-        for b in self.blocks:
-            b.fusion.weight = mx.zeros_like(b.fusion.weight)
-            b.k_to_controls.weight = mx.zeros_like(b.k_to_controls.weight)
-            self._zero_init_proj([b.shared_stream])
-
-    def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
-        x0 = x
-        for block in self.blocks:
-            x = block(x, x0)
-        return self.final_norm(x)
-
-
-class LoopedMPKGPT(BaseModel):
-    """MPK + depth recurrence + optional per-loop LoRA + optional mHC-Lite + optional stride schedule."""
-    def __init__(self, vocab_size: int, num_unique_blocks: int, num_loops: int, dim: int,
-                 num_heads: int, num_kv_heads: int, mlp_mult: int, lora_rank: int,
-                 mhc_streams: int, stride_schedule: str, logit_chunk_tokens: int,
-                 logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float, k_stride: int, m_stride: int, mlp_type: str = "relu2"):
-        super().__init__(vocab_size, dim, logit_chunk_tokens, logit_softcap, tied_embed_init_std)
-        self.num_unique_blocks = num_unique_blocks
-        self.num_loops = num_loops
-        self.lora_rank = lora_rank
-        self.mhc_streams = mhc_streams
-        # Parse stride schedule: "4,8;2,4;1,2" → [(4,8), (2,4), (1,2)]
-        if stride_schedule:
-            self.stride_schedule = [tuple(int(x) for x in pair.split(","))
-                                    for pair in stride_schedule.split(";")]
-            if len(self.stride_schedule) != num_loops:
-                raise ValueError(f"STRIDE_SCHEDULE has {len(self.stride_schedule)} entries but NUM_LOOPS={num_loops}")
-        else:
-            self.stride_schedule = [(k_stride, m_stride)] * num_loops  # uniform
-        self.blocks = [MPKBlock(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                                k_stride, m_stride, mlp_type)
-                       for _ in range(num_unique_blocks)]
-        self.loop_emb = mx.zeros((num_loops, dim), dtype=mx.float32)
-        # Per-loop LoRA on the shared_stream attention (Q/V)
-        if lora_rank > 0:
-            kv_dim = num_kv_heads * (dim // num_heads)
-            self.loop_lora_q = [[LoRAAdapter(dim, dim, lora_rank) for _ in range(num_unique_blocks)]
-                                for _ in range(num_loops)]
-            self.loop_lora_v = [[LoRAAdapter(dim, kv_dim, lora_rank) for _ in range(num_unique_blocks)]
-                                for _ in range(num_loops)]
-        # mHC-Lite: one mixing layer per unique block (shared across loops)
-        if mhc_streams == 4:
-            self.mhc = [mHCLite(dim, n_streams=4) for _ in range(num_unique_blocks)]
-        for b in self.blocks:
-            b.fusion.weight = mx.zeros_like(b.fusion.weight)
-            b.k_to_controls.weight = mx.zeros_like(b.k_to_controls.weight)
-            self._zero_init_proj([b.shared_stream])
-
-    def _apply_lora(self, block, loop_idx, block_idx, x):
-        if self.lora_rank > 0:
-            attn = block.shared_stream.attn
-            normed = block.shared_stream.attn_norm(x)
-            attn._lora_q_delta = self.loop_lora_q[loop_idx][block_idx](normed)
-            attn._lora_v_delta = self.loop_lora_v[loop_idx][block_idx](normed)
-
-    def _clear_lora(self, block):
-        if self.lora_rank > 0:
-            block.shared_stream.attn._lora_q_delta = None
-            block.shared_stream.attn._lora_v_delta = None
-
-    def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
-        x0 = x
-
-        if self.mhc_streams == 4:
-            B, T, D = x.shape
-            n = 4
-            x_s = mx.broadcast_to(x[:, :, None, :], (B, T, n, D))
-            for loop_idx in range(self.num_loops):
-                loop_signal = self.loop_emb[loop_idx].astype(x.dtype)
-                ks, ms = self.stride_schedule[loop_idx]
-                for block_idx, block in enumerate(self.blocks):
-                    x_in = self.mhc[block_idx].mix_to_one(x_s) + loop_signal[None, None, :]
-                    self._apply_lora(block, loop_idx, block_idx, x_in)
-                    block_out = block(x_in, x0, k_stride=ks, m_stride=ms)
-                    self._clear_lora(block)
-                    x_s = self.mhc[block_idx](x_s, block_out)
-            x = x_s.mean(axis=2)
-        else:
-            for loop_idx in range(self.num_loops):
-                loop_signal = self.loop_emb[loop_idx].astype(x.dtype)
-                ks, ms = self.stride_schedule[loop_idx]
-                for block_idx, block in enumerate(self.blocks):
-                    x_in = x + loop_signal[None, None, :]
-                    self._apply_lora(block, loop_idx, block_idx, x_in)
-                    x = block(x_in, x0, k_stride=ks, m_stride=ms)
-                    self._clear_lora(block)
-
-        return self.final_norm(x)
 
 
 def build_model(args: Hyperparameters) -> nn.Module:
@@ -828,15 +679,8 @@ def build_model(args: Hyperparameters) -> nn.Module:
         return GPT(num_layers=args.num_layers, **common)
     if args.model_family == "looped":
         return LoopedGPT(num_unique_blocks=args.num_unique_blocks, num_loops=args.num_loops,
-                         lora_rank=args.lora_rank, **common)
-    if args.model_family == "mpk":
-        return MPKGPT(num_layers=args.num_layers, k_stride=args.mpk_k_stride,
-                      m_stride=args.mpk_m_stride, **common)
-    if args.model_family == "mpk_looped":
-        return LoopedMPKGPT(num_unique_blocks=args.num_unique_blocks, num_loops=args.num_loops,
-                            lora_rank=args.lora_rank, mhc_streams=args.mhc_streams,
-                            stride_schedule=args.stride_schedule,
-                            k_stride=args.mpk_k_stride, m_stride=args.mpk_m_stride, **common)
+                         lora_rank=args.lora_rank, bigram_vocab_size=args.bigram_vocab_size,
+                         bigram_dim=args.bigram_dim, **common)
     raise ValueError(f"Unknown MODEL_FAMILY={args.model_family!r}")
 
 
@@ -1328,7 +1172,7 @@ def main() -> None:
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     first_block = model.blocks[0]
-    first_attn = first_block.shared_stream.attn if hasattr(first_block, 'shared_stream') else first_block.attn
+    first_attn = first_block.attn
     log(f"dtypes tok_emb:{model.tok_emb.weight.dtype} linear_weight:{first_attn.c_q.weight.dtype}")
 
     # ==============================================================================
