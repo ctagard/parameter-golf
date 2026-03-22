@@ -724,12 +724,11 @@ def make_mlp(dim: int, mlp_mult: int, mlp_type: str = "relu2") -> nn.Module:
 class LoRAAdapter(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, rank: int):
         super().__init__()
-        self.base_scale = float(rank ** 0.5) / rank
-        self.warmup_mul = 1.0  # set by training loop
+        self.scale = float(rank ** 0.5) / rank  # alpha=sqrt(rank), fixed
         self.A = nn.Parameter(torch.randn(in_dim, rank) * 0.01)
         self.B = nn.Parameter(torch.zeros(rank, out_dim))
     def forward(self, x: Tensor) -> Tensor:
-        return ((x @ self.A.to(x.dtype)) @ self.B.to(x.dtype)) * (self.base_scale * self.warmup_mul)
+        return ((x @ self.A.to(x.dtype)) @ self.B.to(x.dtype)) * self.scale
 
 def _build_perm_matrices(n: int) -> Tensor:
     from itertools import permutations
@@ -1345,18 +1344,11 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        # LoRA A unfreeze: after warmup steps, enable gradients + reset Muon buffers
+        # LoRA A unfreeze: after warmup, enable gradients (Muon buffers init lazily on first step)
         if args.lora_rank > 0 and step == args.lora_warmup_steps and lora_a_params:
             for p in lora_a_params:
                 p.requires_grad_(True)
-            # Reset Muon momentum buffers for A — they accumulated degenerate signal
-            for group in optimizer_muon.param_groups:
-                for p in group["params"]:
-                    if any(p is la for la in lora_a_params):
-                        state = optimizer_muon.state.get(p)
-                        if state and "momentum_buffer" in state:
-                            state["momentum_buffer"].zero_()
-            log0(f"lora_A_unfrozen at step {step}, muon buffers reset")
+            log0(f"lora_A_unfrozen at step {step}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
