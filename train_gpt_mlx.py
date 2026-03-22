@@ -87,6 +87,7 @@ class Hyperparameters:
     num_loops: int = int(os.environ.get("NUM_LOOPS", 3))
     lora_rank: int = int(os.environ.get("LORA_RANK", 0))  # 0 = no per-loop LoRA
     ortho_lora: bool = bool(int(os.environ.get("ORTHO_LORA", "0")))  # SVD-based orthogonal init
+    lora_warmup_steps: int = int(os.environ.get("LORA_WARMUP_STEPS", 50))  # linear alpha warmup
     mhc_streams: int = int(os.environ.get("MHC_STREAMS", 0))  # 0 = disabled, 4 = mHC-Lite with 4 streams
     bigram_vocab_size: int = int(os.environ.get("BIGRAM_VOCAB_SIZE", 0))  # 0=disabled, 4096=recommended
     bigram_dim: int = int(os.environ.get("BIGRAM_DIM", 128))
@@ -406,16 +407,15 @@ class Block(nn.Module):
 
 
 class LoRAAdapter(nn.Module):
-    """Low-rank adapter: output = (x @ A @ B) * scale. Alpha scaling prevents
-    large adapter output when B first activates from zero."""
+    """Low-rank adapter: output = (x @ A @ B) * scale * warmup_mul."""
     def __init__(self, in_dim: int, out_dim: int, rank: int):
         super().__init__()
-        self.scale = float(rank ** 0.5) / rank  # alpha=sqrt(rank), scale=1/sqrt(rank)
+        self.base_scale = float(rank ** 0.5) / rank  # alpha=sqrt(rank), scale=1/sqrt(rank)
         self.A = mx.random.normal((in_dim, rank), dtype=mx.float32) * 0.01
         self.B = mx.zeros((rank, out_dim), dtype=mx.float32)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        return ((x @ self.A.astype(x.dtype)) @ self.B.astype(x.dtype)) * self.scale
+    def __call__(self, x: mx.array, warmup_mul: float = 1.0) -> mx.array:
+        return ((x @ self.A.astype(x.dtype)) @ self.B.astype(x.dtype)) * (self.base_scale * warmup_mul)
 
 
 class SmearGate(nn.Module):
@@ -641,6 +641,7 @@ class LoopedGPT(BaseModel):
         self.num_unique_blocks = num_unique_blocks
         self.num_loops = num_loops
         self.lora_rank = lora_rank
+        self._lora_warmup_mul = 1.0  # updated by training loop
         self.smear = SmearGate(dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, dim) if bigram_vocab_size > 0 else None
         self.blocks = [Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mlp_type)
@@ -685,14 +686,17 @@ class LoopedGPT(BaseModel):
             x = x + self.bigram(input_ids).astype(COMPUTE_DTYPE)
         x = self.smear(rms_norm(x))
         x0 = x
+        wm = self._lora_warmup_mul  # set by training loop before each step
         for loop_idx in range(self.num_loops):
             loop_signal = self.loop_emb[loop_idx].astype(x.dtype)
             for block_idx, block in enumerate(self.blocks):
                 x_in = x + loop_signal[None, None, :]
                 if self.lora_rank > 0:
                     li = loop_idx * self.num_unique_blocks + block_idx
-                    qd = getattr(self, f"lora_q_{li}")
-                    vd = getattr(self, f"lora_v_{li}")
+                    lq = getattr(self, f"lora_q_{li}")
+                    lv = getattr(self, f"lora_v_{li}")
+                    qd = lambda n, a=lq, w=wm: a(n, w)
+                    vd = lambda n, a=lv, w=wm: a(n, w)
                 else:
                     qd, vd = None, None
                 x = block(x_in, x0, qd, vd)
@@ -1277,6 +1281,9 @@ def main() -> None:
             break
 
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
+        # LoRA alpha warmup: linearly scale adapter contribution from 0→1
+        if hasattr(model, '_lora_warmup_mul') and args.lora_rank > 0:
+            model._lora_warmup_mul = min(step / max(args.lora_warmup_steps, 1), 1.0)
         step_t0 = time.perf_counter()
 
         accum: dict[str, mx.array] | None = None

@@ -101,6 +101,7 @@ class Hyperparameters:
     num_unique_blocks = int(os.environ.get("NUM_UNIQUE_BLOCKS", 3))
     num_loops = int(os.environ.get("NUM_LOOPS", 3))
     lora_rank = int(os.environ.get("LORA_RANK", 0))
+    lora_warmup_steps = int(os.environ.get("LORA_WARMUP_STEPS", 50))
     mhc_streams = int(os.environ.get("MHC_STREAMS", 0))
     mlp_type = os.environ.get("MLP_TYPE", "relu2").strip().lower()
     wandb_project = os.environ.get("WANDB_PROJECT", "")
@@ -136,8 +137,6 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
-
-
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, weight_decay: float = 0.0):
         super().__init__(
@@ -197,8 +196,6 @@ class Muon(torch.optim.Optimizer):
                 curr += p.numel()
 
         return loss
-
-
 # TOKENIZER-AGNOSTIC EVALUATION SETUP 
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
@@ -231,8 +228,6 @@ def build_sentencepiece_luts(
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
-
-
 def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
@@ -243,8 +238,6 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
-
-
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
@@ -305,8 +298,6 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
-
 def eval_val_sliding(args, model, rank, world_size, device, val_tokens,
                      base_bytes_lut, has_leading_space_lut, is_boundary_token_lut):
     """Sliding window eval with stride. Each scored token gets near-full context."""
@@ -344,8 +335,6 @@ def eval_val_sliding(args, model, rank, world_size, device, val_tokens,
     val_bpb = (loss_sum / math.log(2.0)) / max(byte_sum, 1.0)
     base_model.train()
     return val_loss, val_bpb
-
-
 def eval_val_ttt(args, model, rank, world_size, device, val_tokens,
                  base_bytes_lut, has_leading_space_lut, is_boundary_token_lut):
     """Test-time training: adapt small LoRA on lm_head per document chunk before scoring."""
@@ -400,8 +389,6 @@ def eval_val_ttt(args, model, rank, world_size, device, val_tokens,
     val_bpb = (loss_sum / math.log(2.0)) / max(byte_sum, 1.0)
     base_model.train()
     return val_loss, val_bpb
-
-
 # POST-TRAINING QUANTIZATION
 #
 # It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
@@ -541,8 +528,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
     return out
-
-
 # DATA LOADING 
 
 def load_data_shard(file: Path) -> Tensor:
@@ -560,8 +545,6 @@ def load_data_shard(file: Path) -> Tensor:
     if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
-
-
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
@@ -591,8 +574,6 @@ class TokenStream:
             self.pos += k
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
-
-
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
@@ -621,23 +602,17 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
-
-
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
-
-
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
-
-
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -661,14 +636,10 @@ class Rotary(nn.Module):
             self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
-
-
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-
-
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -721,8 +692,6 @@ class CausalSelfAttention(nn.Module):
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
-
-
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
     def __init__(self, dim: int, mlp_mult: float):
@@ -735,8 +704,6 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
-
-
 class SwiGLUMLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
@@ -756,11 +723,12 @@ def make_mlp(dim: int, mlp_mult: int, mlp_type: str = "relu2") -> nn.Module:
 class LoRAAdapter(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, rank: int):
         super().__init__()
-        self.scale = float(rank ** 0.5) / rank  # alpha=sqrt(rank), scale=1/sqrt(rank)
+        self.base_scale = float(rank ** 0.5) / rank
+        self.warmup_mul = 1.0  # set by training loop
         self.A = nn.Parameter(torch.randn(in_dim, rank) * 0.01)
         self.B = nn.Parameter(torch.zeros(rank, out_dim))
     def forward(self, x: Tensor) -> Tensor:
-        return ((x @ self.A.to(x.dtype)) @ self.B.to(x.dtype)) * self.scale
+        return ((x @ self.A.to(x.dtype)) @ self.B.to(x.dtype)) * (self.base_scale * self.warmup_mul)
 
 def _build_perm_matrices(n: int) -> Tensor:
     from itertools import permutations
@@ -807,8 +775,6 @@ class mHCLite(nn.Module):
         x_flat = F.rms_norm(x_streams.reshape(B, T, n * D), (n * D,))
         H_pre = torch.sigmoid(self.alpha_pre * self.pre_proj(x_flat))
         return (H_pre.unsqueeze(-1) * x_streams).sum(dim=2)
-
-
 class SmearGate(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -817,8 +783,6 @@ class SmearGate(nn.Module):
         g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
         x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
         return (1 - g) * x + g * x_prev
-
-
 class BigramHashEmbedding(nn.Module):
     def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
         super().__init__()
@@ -843,8 +807,6 @@ class BigramHashEmbedding(nn.Module):
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
-
-
 class Block(nn.Module):
     def __init__(
         self,
@@ -875,8 +837,6 @@ class Block(nn.Module):
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
-
-
 class GPT(nn.Module):
     def __init__(
         self,
@@ -976,8 +936,6 @@ class GPT(nn.Module):
             return F.cross_entropy(
                 logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none").reshape(bsz, sl)
         return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), target_ids.reshape(-1), reduction="mean")
-
-
 class LoopedGPT(nn.Module):
     def __init__(self, vocab_size: int, num_unique_blocks: int, num_loops: int, model_dim: int,
                  num_heads: int, num_kv_heads: int, mlp_mult: float, lora_rank: int, mhc_streams: int,
@@ -1360,6 +1318,12 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        # LoRA alpha warmup
+        if args.lora_rank > 0:
+            wm = min(step / max(args.lora_warmup_steps, 1), 1.0)
+            for m in base_model.modules():
+                if isinstance(m, LoRAAdapter):
+                    m.warmup_mul = wm
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1496,7 +1460,5 @@ def main() -> None:
 
     if distributed:
         dist.destroy_process_group()
-
-
 if __name__ == "__main__":
     main()
