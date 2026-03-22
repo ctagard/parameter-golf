@@ -278,3 +278,24 @@ All variants now use `_AttnPool`: a learned query that attends over T positions 
 8. **Table-stakes mods give ~0.04 BPB** — SmearGate + BigramHash + OrthoInit + WD
 9. **Hypernetworks don't help at 300 steps** — tested .mean(), delta-from-origin, EMA, SSM+attention pooling. All variants worse than no hypernet. Extra params dilute optimizer at this training scale.
 10. **Simpler is better** — every "clever" addition (MPK, hypernetworks) hurt. The winning recipe is clean depth recurrence + LoRA + mHC + table-stakes.
+
+---
+
+## Critical Bug Fixes (2026-03-22)
+
+### MLX LoRA was never applied
+LoRA adapters stored as nested Python lists were invisible to MLX's parameter tracking. `CausalSelfAttention` never consumed the `_lora_q_delta` attributes. **All prior MLX LoRA experiments were running without LoRA.** Fixed by storing A/B as stacked 3D tensors and passing deltas via Block.forward(q_delta_fn, v_delta_fn).
+
+**Impact:** MLX Phase 1 results (loop_3x3_768 beating baseline) were valid — they never used LoRA. The "mHC + LoRA" 4-way comparison at dim=256 was actually "mHC only" on MLX. PyTorch/A100 results ARE correct (PyTorch used q_delta_fn properly).
+
+**Current status:** MLX LoRA still produces NaN at all tested batch sizes and LRs. Likely a gradient issue with 3D tensor params through MLX's `value_and_grad`. **LoRA diagnostics must be done on CUDA/A100, not MLX.**
+
+### BigramHash NaN from operator precedence
+`(36313 * t) ^ (27191 * t) % mod` was parsed as `XOR (... % mod)` not `(XOR ...) % mod`. Also, XOR of large int32 values can produce negative indices. Fixed with explicit `abs()` and parentheses in both PyTorch and MLX.
+
+### LoRA Diagnostic Results (MLX, partial)
+- **No LoRA, batch=32k:** val_bpb=2.0653 @ 200 steps (works, matches prior results)
+- **No LoRA, batch=8k:** val_bpb=2.3958 @ 200 steps (works)
+- **LoRA rank=32, any batch:** NaN from step 1 (MLX-specific bug, works on PyTorch)
+
+**Decision:** Run LoRA diagnostics (Experiments 1-4) on A100 instead of MLX. The PyTorch code handles LoRA correctly.
