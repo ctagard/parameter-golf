@@ -293,9 +293,25 @@ LoRA adapters stored as nested Python lists were invisible to MLX's parameter tr
 ### BigramHash NaN from operator precedence
 `(36313 * t) ^ (27191 * t) % mod` was parsed as `XOR (... % mod)` not `(XOR ...) % mod`. Also, XOR of large int32 values can produce negative indices. Fixed with explicit `abs()` and parentheses in both PyTorch and MLX.
 
-### LoRA Diagnostic Results (MLX, partial)
-- **No LoRA, batch=32k:** val_bpb=2.0653 @ 200 steps (works, matches prior results)
-- **No LoRA, batch=8k:** val_bpb=2.3958 @ 200 steps (works)
-- **LoRA rank=32, any batch:** NaN from step 1 (MLX-specific bug, works on PyTorch)
+### LoRA Diagnostic Results (MLX, with setattr fix)
 
-**Decision:** Run LoRA diagnostics (Experiments 1-4) on A100 instead of MLX. The PyTorch code handles LoRA correctly.
+**Experiment 3: No LoRA vs Standard Init vs Orthogonal Init**
+
+Setup: 200 steps, batch=8192, dim=512, 3×3 loops, SwiGLU, no mHC, no BigramHash.
+
+| Config | val_bpb | Train Loss @200 | ms/step | Params |
+|--------|---------|----------------|---------|--------|
+| **No LoRA** | **2.4009** | 3.86 | 363 | 7.6M |
+| LoRA rank=32 (standard) | 3.0841 | 5.20 | 406 | 8.1M |
+| LoRA rank=32 (ortho SVD) | 3.0880 | 5.26 | 388 | 8.1M |
+
+**LoRA hurts by 0.68 BPB on MLX at 200 steps.** Orthogonal init ≈ standard init (3.088 vs 3.084) — init geometry doesn't matter. The problem is LR interference: LoRA gradients pollute base weight updates at shared learning rate.
+
+**Root cause:** On step 1, A is random and B is zero, so adapter output is zero. But gradients flow through A and create noise in the base weight updates. The coupled oscillation takes many steps to resolve, wasting the first ~100 steps.
+
+**Fix for PyTorch (not needed for MLX since LoRA works on CUDA):**
+- Drop LoRA learning rate to 1/10th of base: `scalar_lr=0.004` for LoRA params
+- Or: freeze LoRA for first 50 warmup steps, then unfreeze
+- The `split_model_params` already routes LoRA to Adam — just need a separate LR group
+
+**Key insight:** LoRA on PyTorch/A100 showed clean training (no interference) because the PyTorch Muon optimizer handles the gradient paths differently. The MLX Muon + Adam split may be routing LoRA gradients incorrectly or the gradient scaling differs. **LoRA validation should happen on CUDA only.**
