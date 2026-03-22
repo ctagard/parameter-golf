@@ -102,6 +102,7 @@ class Hyperparameters:
     num_loops = int(os.environ.get("NUM_LOOPS", 3))
     lora_rank = int(os.environ.get("LORA_RANK", 0))
     lora_warmup_steps = int(os.environ.get("LORA_WARMUP_STEPS", 50))
+    ortho_lora = bool(int(os.environ.get("ORTHO_LORA", "0")))
     mhc_streams = int(os.environ.get("MHC_STREAMS", 0))
     mlp_type = os.environ.get("MLP_TYPE", "relu2").strip().lower()
     wandb_project = os.environ.get("WANDB_PROJECT", "")
@@ -941,7 +942,7 @@ class LoopedGPT(nn.Module):
                  num_heads: int, num_kv_heads: int, mlp_mult: float, lora_rank: int, mhc_streams: int,
                  tie_embeddings: bool, tied_embed_init_std: float, logit_softcap: float,
                  rope_base: float, qk_gain_init: float, mlp_type: str = "relu2",
-                 bigram_vocab_size: int = 0, bigram_dim: int = 128):
+                 bigram_vocab_size: int = 0, bigram_dim: int = 128, ortho_lora: bool = False):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -963,6 +964,15 @@ class LoopedGPT(nn.Module):
             kv_dim = num_kv_heads * (model_dim // num_heads)
             self.loop_lora_q = nn.ModuleList([nn.ModuleList([LoRAAdapter(model_dim, model_dim, lora_rank) for _ in range(num_unique_blocks)]) for _ in range(num_loops)])
             self.loop_lora_v = nn.ModuleList([nn.ModuleList([LoRAAdapter(model_dim, kv_dim, lora_rank) for _ in range(num_unique_blocks)]) for _ in range(num_loops)])
+            if ortho_lora:
+                with torch.no_grad():
+                    for bi in range(num_unique_blocks):
+                        for proj, loras in [("q", self.loop_lora_q), ("v", self.loop_lora_v)]:
+                            w = self.blocks[bi].attn.c_q.weight if proj == "q" else self.blocks[bi].attn.c_v.weight
+                            _, _, Vh = torch.linalg.svd(w.float(), full_matrices=True)
+                            cols = Vh[-(num_loops * lora_rank):].T
+                            for li in range(num_loops):
+                                loras[li][bi].A.data = cols[:, li*lora_rank:(li+1)*lora_rank].clone()
         if mhc_streams == 4:
             self.mhc = nn.ModuleList([mHCLite(model_dim, 4) for _ in range(num_unique_blocks)])
         self._init_weights(tied_embed_init_std)
@@ -1037,10 +1047,11 @@ def build_model(args: Hyperparameters) -> nn.Module:
         return GPT(num_layers=args.num_layers, **common)
     if args.model_family == "looped":
         return LoopedGPT(num_unique_blocks=args.num_unique_blocks, num_loops=args.num_loops,
-                         lora_rank=args.lora_rank, mhc_streams=args.mhc_streams, **common)
+                         lora_rank=args.lora_rank, mhc_streams=args.mhc_streams,
+                         ortho_lora=args.ortho_lora, **common)
     raise ValueError(f"Unknown MODEL_FAMILY={args.model_family!r}")
 
-def split_model_params(model: nn.Module) -> tuple[Tensor, list[Tensor], list[Tensor], list[Tensor]]:
+def split_model_params(model: nn.Module):
     tok_param = model.tok_emb.weight
     used = {id(tok_param)}
     head_params = []
@@ -1049,18 +1060,22 @@ def split_model_params(model: nn.Module) -> tuple[Tensor, list[Tensor], list[Ten
         used.add(id(model.lm_head.weight))
     if getattr(model, "bigram", None) is not None and hasattr(model.bigram, "embed"):
         used.add(id(model.bigram.embed.weight))
-        # bigram embed goes in head_params to get token_lr via Adam
         head_params.append(model.bigram.embed.weight)
-    matrix_params, scalar_params = [], []
+    matrix_params, scalar_params, lora_a_params, lora_b_params = [], [], [], []
     for name, p in model.named_parameters():
         if id(p) in used:
             continue
+        is_lora_a = "lora" in name.lower() and name.endswith(".A")
         is_lora_b = "lora" in name.lower() and name.endswith(".B")
-        if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS) and not is_lora_b:
+        if is_lora_a:
+            lora_a_params.append(p)
+        elif is_lora_b:
+            lora_b_params.append(p)
+        elif p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS):
             matrix_params.append(p)
         else:
             scalar_params.append(p)
-    return tok_param, head_params, matrix_params, scalar_params
+    return tok_param, head_params, matrix_params, scalar_params, lora_a_params, lora_b_params
 
 # TRAINING
 
@@ -1181,19 +1196,31 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    tok_param, head_params, matrix_params, scalar_params = split_model_params(base_model)
+    tok_param, head_params, matrix_params, scalar_params, lora_a_params, lora_b_params = split_model_params(base_model)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.AdamW(
         [{"params": [tok_param], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=args.adam_weight_decay, fused=True)
-    optimizer_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum,
+    # LoRA A goes to Muon alongside base weights, but frozen during warmup
+    all_muon_params = matrix_params + lora_a_params
+    optimizer_muon = Muon(all_muon_params, lr=args.matrix_lr, momentum=args.muon_momentum,
                           backend_steps=args.muon_backend_steps, weight_decay=args.muon_weight_decay)
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
+    # Freeze LoRA A for warmup — will unfreeze in training loop
+    for p in lora_a_params:
+        p.requires_grad_(False)
     optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=args.adam_weight_decay, fused=True)
     optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    # LoRA B: separate Adam at 0.1x scalar_lr
+    if lora_b_params:
+        lora_b_lr = args.scalar_lr * 0.1
+        optimizer_lora_b = torch.optim.AdamW(
+            [{"params": lora_b_params, "lr": lora_b_lr, "base_lr": lora_b_lr}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=args.adam_weight_decay, fused=True)
+        optimizers.append(optimizer_lora_b)
     if head_params:
         optimizer_head = torch.optim.AdamW(
             [{"params": head_params, "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1318,12 +1345,18 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        # LoRA alpha warmup
-        if args.lora_rank > 0:
-            wm = min(step / max(args.lora_warmup_steps, 1), 1.0)
-            for m in base_model.modules():
-                if isinstance(m, LoRAAdapter):
-                    m.warmup_mul = wm
+        # LoRA A unfreeze: after warmup steps, enable gradients + reset Muon buffers
+        if args.lora_rank > 0 and step == args.lora_warmup_steps and lora_a_params:
+            for p in lora_a_params:
+                p.requires_grad_(True)
+            # Reset Muon momentum buffers for A — they accumulated degenerate signal
+            for group in optimizer_muon.param_groups:
+                for p in group["params"]:
+                    if any(p is la for la in lora_a_params):
+                        state = optimizer_muon.state.get(p)
+                        if state and "momentum_buffer" in state:
+                            state["momentum_buffer"].zero_()
+            log0(f"lora_A_unfrozen at step {step}, muon buffers reset")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
