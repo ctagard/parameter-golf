@@ -75,40 +75,35 @@ def run_config(name: str, extra_env: dict) -> dict:
     return {"name": name, "val_bpb": val_bpb, "params": model_params, "elapsed": elapsed}
 
 
-def analyze_lora_weights(run_id: str):
+def analyze_lora_weights(run_id: str, num_loops: int = 3, num_blocks: int = 3):
     """Analyze LoRA weight diversity from a trained model."""
-    try:
-        import mlx.core as mx
-        from mlx.utils import tree_flatten
-    except ImportError:
-        print("MLX not available for weight analysis")
-        return
-
     model_path = LOGS_DIR / f"{run_id}_mlx_model.npz"
     if not model_path.exists():
         print(f"Model file not found: {model_path}")
         return
 
-    # Load weights
     weights = dict(np.load(str(model_path), allow_pickle=True))
 
     print(f"\n{'='*60}")
     print(f"LoRA Weight Analysis: {run_id}")
     print(f"{'='*60}")
 
-    # Find LoRA A matrices
-    lora_keys = sorted([k for k in weights.keys() if "lora_q" in k and ".A" in k])
+    # Keys are: lora_q_0.A, lora_q_0.B, lora_v_0.A, etc.
+    # Index = loop_idx * num_blocks + block_idx
+    lora_keys = sorted([k for k in weights.keys() if k.startswith("lora_q_") and k.endswith(".A")])
     if not lora_keys:
-        print("No LoRA weights found")
+        print("No LoRA weights found in npz. Keys:", [k for k in weights.keys() if "lora" in k][:10])
         return
 
-    # Experiment 1: Cosine similarity between loops
-    print("\n--- Cosine Similarity Between Loops ---")
-    for block_idx in range(3):
-        for loop_a in range(3):
-            for loop_b in range(loop_a + 1, 3):
-                key_a = f"loop_lora_q.{loop_a}.{block_idx}.A"
-                key_b = f"loop_lora_q.{loop_b}.{block_idx}.A"
+    # Experiment 1: Cosine similarity between loops (same block, different loops)
+    print("\n--- Experiment 1: Cosine Similarity Between Loops ---")
+    for block_idx in range(num_blocks):
+        for loop_a in range(num_loops):
+            for loop_b in range(loop_a + 1, num_loops):
+                idx_a = loop_a * num_blocks + block_idx
+                idx_b = loop_b * num_blocks + block_idx
+                key_a = f"lora_q_{idx_a}.A"
+                key_b = f"lora_q_{idx_b}.A"
                 if key_a in weights and key_b in weights:
                     A_a = weights[key_a].flatten().astype(np.float32)
                     A_b = weights[key_b].flatten().astype(np.float32)
@@ -116,30 +111,33 @@ def analyze_lora_weights(run_id: str):
                     norm_b = np.linalg.norm(A_b)
                     if norm_a > 0 and norm_b > 0:
                         sim = np.dot(A_a, A_b) / (norm_a * norm_b)
-                        print(f"  block={block_idx} loop={loop_a} vs loop={loop_b}: cos_sim={sim:.4f}")
+                        print(f"  Q block={block_idx} loop={loop_a} vs loop={loop_b}: cos_sim={sim:.4f}")
+                # Also check V
+                key_a_v = f"lora_v_{idx_a}.A"
+                key_b_v = f"lora_v_{idx_b}.A"
+                if key_a_v in weights and key_b_v in weights:
+                    A_a = weights[key_a_v].flatten().astype(np.float32)
+                    A_b = weights[key_b_v].flatten().astype(np.float32)
+                    norm_a = np.linalg.norm(A_a)
+                    norm_b = np.linalg.norm(A_b)
+                    if norm_a > 0 and norm_b > 0:
+                        sim = np.dot(A_a, A_b) / (norm_a * norm_b)
+                        print(f"  V block={block_idx} loop={loop_a} vs loop={loop_b}: cos_sim={sim:.4f}")
 
-    # Experiment 4: LoRA weight norms
-    print("\n--- LoRA Effective Norms (||B @ A^T||_F) ---")
-    for loop_idx in range(3):
-        for block_idx in range(3):
-            key_a = f"loop_lora_q.{loop_idx}.{block_idx}.A"
-            key_b = f"loop_lora_q.{loop_idx}.{block_idx}.B"
-            if key_a in weights and key_b in weights:
-                A = weights[key_a].astype(np.float32)
-                B = weights[key_b].astype(np.float32)
-                effective = np.linalg.norm(B @ A.T)
-                print(f"  Q lora loop={loop_idx} block={block_idx}: norm={effective:.6f}")
-
-    # V LoRA norms
-    for loop_idx in range(3):
-        for block_idx in range(3):
-            key_a = f"loop_lora_v.{loop_idx}.{block_idx}.A"
-            key_b = f"loop_lora_v.{loop_idx}.{block_idx}.B"
-            if key_a in weights and key_b in weights:
-                A = weights[key_a].astype(np.float32)
-                B = weights[key_b].astype(np.float32)
-                effective = np.linalg.norm(B @ A.T)
-                print(f"  V lora loop={loop_idx} block={block_idx}: norm={effective:.6f}")
+    # Experiment 4: LoRA effective norms
+    print("\n--- Experiment 4: LoRA Effective Norms (||B @ A^T||_F) ---")
+    for loop_idx in range(num_loops):
+        for block_idx in range(num_blocks):
+            idx = loop_idx * num_blocks + block_idx
+            for prefix in ["lora_q", "lora_v"]:
+                key_a = f"{prefix}_{idx}.A"
+                key_b = f"{prefix}_{idx}.B"
+                if key_a in weights and key_b in weights:
+                    A = weights[key_a].astype(np.float32)
+                    B = weights[key_b].astype(np.float32)
+                    effective = np.linalg.norm(B @ A.T)
+                    label = "Q" if "q" in prefix else "V"
+                    print(f"  {label} loop={loop_idx} block={block_idx}: norm={effective:.6f}")
 
 
 def main():
