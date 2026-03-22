@@ -332,11 +332,14 @@ class CausalSelfAttention(nn.Module):
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, q_delta=None, v_delta=None) -> mx.array:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = self.c_q(x) + (q_delta if q_delta is not None else 0)
+        k = self.c_k(x)
+        v = self.c_v(x) + (v_delta if v_delta is not None else 0)
+        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = k.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
@@ -388,10 +391,13 @@ class Block(nn.Module):
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, x0: mx.array, q_delta_fn=None, v_delta_fn=None) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        n = self.attn_norm(x)
+        qd = q_delta_fn(n) if q_delta_fn is not None else None
+        vd = v_delta_fn(n) if v_delta_fn is not None else None
+        attn_out = self.attn(n, qd, vd)
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -434,8 +440,9 @@ class BigramHashEmbedding(nn.Module):
     def __call__(self, token_ids: mx.array) -> mx.array:
         t = token_ids.astype(mx.int32)
         mod = self.bigram_vocab_size - 1
+        raw = (36313 * t[:, 1:]) ^ (27191 * t[:, :-1])
         hashed = mx.concatenate([mx.full(t[:, :1].shape, mod, dtype=mx.int32),
-                                  (36313 * t[:, 1:]) ^ (27191 * t[:, :-1]) % mod], axis=1)
+                                  mx.abs(raw) % mod], axis=1)
         h = self.embed(hashed)
         if self.proj is not None:
             h = self.proj(h)
@@ -655,14 +662,9 @@ class LoopedGPT(BaseModel):
             loop_signal = self.loop_emb[loop_idx].astype(x.dtype)
             for block_idx, block in enumerate(self.blocks):
                 x_in = x + loop_signal[None, None, :]
-                if self.lora_rank > 0:
-                    normed = block.attn_norm(x_in)
-                    block.attn._lora_q_delta = self.loop_lora_q[loop_idx][block_idx](normed)
-                    block.attn._lora_v_delta = self.loop_lora_v[loop_idx][block_idx](normed)
-                x = block(x_in, x0)
-                if self.lora_rank > 0:
-                    block.attn._lora_q_delta = None
-                    block.attn._lora_v_delta = None
+                qd = self.loop_lora_q[loop_idx][block_idx] if self.lora_rank > 0 else None
+                vd = self.loop_lora_v[loop_idx][block_idx] if self.lora_rank > 0 else None
+                x = block(x_in, x0, qd, vd)
         return self.final_norm(x)
 
 

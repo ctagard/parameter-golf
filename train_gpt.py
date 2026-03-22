@@ -834,7 +834,7 @@ class BigramHashEmbedding(nn.Module):
         mod = self.bigram_vocab_size - 1
         out = torch.empty_like(t)
         out[..., 0] = mod
-        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]).abs() % mod
         return out.long()
 
     def forward(self, token_ids: Tensor) -> Tensor:
