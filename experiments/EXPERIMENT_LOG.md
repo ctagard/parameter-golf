@@ -314,4 +314,32 @@ Setup: 200 steps, batch=8192, dim=512, 3×3 loops, SwiGLU, no mHC, no BigramHash
 - Or: freeze LoRA for first 50 warmup steps, then unfreeze
 - The `split_model_params` already routes LoRA to Adam — just need a separate LR group
 
-**Key insight:** LoRA on PyTorch/A100 showed clean training (no interference) because the PyTorch Muon optimizer handles the gradient paths differently. The MLX Muon + Adam split may be routing LoRA gradients incorrectly or the gradient scaling differs. **LoRA validation should happen on CUDA only.**
+### LoRA Fix: Muon-on-A + Alpha Warmup + Scaling
+
+Applied three fixes and re-ran:
+1. **LoRA A → Muon** (consistent manifold geometry with base weights)
+2. **Alpha scaling** = sqrt(rank)/rank ≈ 0.177 (prevents magnitude interference)
+3. **Linear warmup** over 50 steps (adapter silent at step 0, full at step 50)
+
+| Config | val_bpb | Gap vs no-LoRA |
+|--------|---------|---------------|
+| **No LoRA** | **2.4160** | — |
+| LoRA standard (fixed) | 2.4359 | +0.020 |
+| **LoRA ortho SVD (fixed)** | **2.4228** | **+0.007** |
+
+**Interference fixed:** Gap dropped from 0.68 → 0.02 BPB. But LoRA still doesn't beat no-LoRA at 200 steps — adapters need more training time to contribute positively.
+
+### Experiment 1: Cosine Similarity (standard init, after 200 steps)
+
+All inter-loop cosine similarities are near zero (-0.024 to +0.042). **Loops naturally learn orthogonal directions** even with random init. No collapse problem. Orthogonal SVD init isn't needed for diversity — the training dynamics handle it.
+
+### Experiment 4: Effective Norms
+
+(Pending — shape mismatch bug in analysis, to be re-run)
+
+### Conclusions
+
+1. Alpha warmup + scaling is essential — without it, LoRA destroys training
+2. Orthogonal SVD init provides marginal benefit (+0.013 BPB) over standard init
+3. At 200 steps on MLX, LoRA adds cost without improving BPB — needs longer training or CUDA validation
+4. Loop LoRA weights are naturally near-orthogonal — no diversity problem to solve

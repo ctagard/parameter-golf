@@ -135,7 +135,7 @@ def analyze_lora_weights(run_id: str, num_loops: int = 3, num_blocks: int = 3):
                 if key_a in weights and key_b in weights:
                     A = weights[key_a].astype(np.float32)
                     B = weights[key_b].astype(np.float32)
-                    effective = np.linalg.norm(B @ A.T)
+                    effective = np.linalg.norm(A @ B)
                     label = "Q" if "q" in prefix else "V"
                     print(f"  {label} loop={loop_idx} block={block_idx}: norm={effective:.6f}")
 
