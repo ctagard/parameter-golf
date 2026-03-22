@@ -753,57 +753,70 @@ class Muon:
 
 
 class SplitOptimizers:
-    # - tok_emb.weight: Adam with the tied-embedding LR
-    # - 2D non-control params: Muon
-    # - everything else (scalars, control tensors, LoRA, loop_emb, skip_weights): Adam
+    # - tok_emb.weight: Adam (tied_embed_lr)
+    # - LoRA A: Muon (matrix_lr), frozen for first lora_warmup_steps
+    # - LoRA B: Adam (scalar_lr * 0.1), lower LR for zero-init activation
+    # - Other 2D non-control: Muon (matrix_lr)
+    # - Everything else: Adam (scalar_lr)
     def __init__(self, model: nn.Module, args: Hyperparameters):
         self.args = args
         params = dict(tree_flatten(model.parameters()))
         self.embed_key = "tok_emb.weight"
+        # LoRA A keys go to Muon (but frozen during warmup)
+        self.lora_a_keys = [k for k in params if "lora" in k.lower() and k.endswith(".A")]
         self.matrix_keys = [
             k for k, p in params.items()
             if k != self.embed_key and p.ndim == 2
             and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-            and not ("lora" in k.lower() and k.endswith(".B"))  # LoRA A→Muon, B→Adam
+            and not ("lora" in k.lower() and k.endswith(".B"))
         ]
+        # LoRA B keys get separate Adam at lower LR
+        self.lora_b_keys = [k for k in params if "lora" in k.lower() and k.endswith(".B")]
         self.scalar_keys = [
             k for k, p in params.items()
-            if k != self.embed_key and k not in self.matrix_keys
+            if k != self.embed_key and k not in self.matrix_keys and k not in self.lora_b_keys
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
         self.adam_embed = optim.Adam(
             learning_rate=args.tied_embed_lr,
-            betas=[args.beta1, args.beta2],
-            eps=args.adam_eps,
-            bias_correction=True,
-        )
+            betas=[args.beta1, args.beta2], eps=args.adam_eps, bias_correction=True)
         self.adam_scalar = optim.Adam(
             learning_rate=args.scalar_lr,
-            betas=[args.beta1, args.beta2],
-            eps=args.adam_eps,
-            bias_correction=True,
-        )
+            betas=[args.beta1, args.beta2], eps=args.adam_eps, bias_correction=True)
+        self.adam_lora_b = optim.Adam(
+            learning_rate=args.scalar_lr * 0.1,  # 10x lower for zero-init B
+            betas=[args.beta1, args.beta2], eps=args.adam_eps, bias_correction=True)
 
-    def step(self, model: GPT, grads_tree: dict, step: int, lr_mul: float) -> None:
+    def step(self, model: nn.Module, grads_tree: dict, step: int, lr_mul: float) -> None:
         params = dict(tree_flatten(model.parameters()))
         grads = dict(tree_flatten(grads_tree))
         updated = dict(params)
 
+        # Freeze LoRA A during warmup: zero its gradients so Muon gets no signal
+        if step < self.args.lora_warmup_steps and self.lora_a_keys:
+            for k in self.lora_a_keys:
+                if k in grads:
+                    grads[k] = mx.zeros_like(grads[k])
+
         updated.update(self.muon.step(params, grads, step=step, lr_mul=lr_mul))
 
         self.adam_embed.learning_rate = self.args.tied_embed_lr * lr_mul
-        updated.update(
-            self.adam_embed.apply_gradients(
-                {self.embed_key: grads[self.embed_key]},
-                {self.embed_key: params[self.embed_key]},
-            )
-        )
+        updated.update(self.adam_embed.apply_gradients(
+            {self.embed_key: grads[self.embed_key]},
+            {self.embed_key: params[self.embed_key]}))
 
         self.adam_scalar.learning_rate = self.args.scalar_lr * lr_mul
-        scalar_grads = {k: grads[k] for k in self.scalar_keys}
-        scalar_params = {k: params[k] for k in self.scalar_keys}
+        scalar_grads = {k: grads[k] for k in self.scalar_keys if k in grads}
+        scalar_params = {k: params[k] for k in self.scalar_keys if k in params}
         updated.update(self.adam_scalar.apply_gradients(scalar_grads, scalar_params))
+
+        # LoRA B: separate Adam at 0.1x scalar_lr
+        if self.lora_b_keys:
+            self.adam_lora_b.learning_rate = self.args.scalar_lr * 0.1 * lr_mul
+            b_grads = {k: grads[k] for k in self.lora_b_keys if k in grads}
+            b_params = {k: params[k] for k in self.lora_b_keys if k in params}
+            updated.update(self.adam_lora_b.apply_gradients(b_grads, b_params))
 
         model.update(tree_unflatten(list(updated.items())))
 
