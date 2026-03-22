@@ -1096,7 +1096,8 @@ def split_model_params(model: nn.Module) -> tuple[Tensor, list[Tensor], list[Ten
     for name, p in model.named_parameters():
         if id(p) in used:
             continue
-        if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS) and "lora" not in name.lower():
+        is_lora_b = "lora" in name.lower() and name.endswith(".B")
+        if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS) and not is_lora_b:
             matrix_params.append(p)
         else:
             scalar_params.append(p)

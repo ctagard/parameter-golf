@@ -758,7 +758,7 @@ class SplitOptimizers:
             k for k, p in params.items()
             if k != self.embed_key and p.ndim == 2
             and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-            and "lora" not in k.lower()
+            and not ("lora" in k.lower() and k.endswith(".B"))  # LoRA A→Muon, B→Adam
         ]
         self.scalar_keys = [
             k for k, p in params.items()
