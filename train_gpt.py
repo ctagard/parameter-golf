@@ -113,7 +113,7 @@ class Hyperparameters:
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0005))
     ttt_steps = int(os.environ.get("TTT_STEPS", 10))
     prune_pct = float(os.environ.get("PRUNE_PCT", 0.0))  # 0=disabled, 0.03=3%
-
+    mhc_alpha = float(os.environ.get("MHC_ALPHA", 0.01))  # init for alpha_res/pre/post
 # MUON OPTIMIZER
 # 
 
@@ -697,20 +697,19 @@ class LoRAAdapter(nn.Module):
         return ((x @ self.A.to(x.dtype)) @ self.B.to(x.dtype)) * self.scale
 
 class mHCLite(nn.Module):
-    def __init__(self, dim: int, n_streams: int = 4):
+    def __init__(self, dim: int, n_streams: int = 4, alpha: float = 0.01):
         super().__init__()
         self.n = n_streams
         self.dim = dim
         n_perms = math.factorial(n_streams)
         self.res_proj = CastedLinear(n_streams * dim, n_perms, bias=False)
         self.pre_proj = CastedLinear(n_streams * dim, n_streams, bias=False)
-        # H_post: project layer output into n different directions per stream
         self.post_content = CastedLinear(dim, n_streams * dim, bias=False)
         self.post_content._zero_init = True
         self.post_gate = CastedLinear(n_streams * dim, n_streams, bias=False)
-        self.alpha_res = nn.Parameter(torch.tensor(0.01))
-        self.alpha_pre = nn.Parameter(torch.tensor(0.01))
-        self.alpha_post = nn.Parameter(torch.tensor(0.01))
+        self.alpha_res = nn.Parameter(torch.tensor(alpha))
+        self.alpha_pre = nn.Parameter(torch.tensor(alpha))
+        self.alpha_post = nn.Parameter(torch.tensor(alpha))
         from itertools import permutations
         perms = list(permutations(range(n_streams)))
         P = torch.zeros(len(perms), n_streams, n_streams)
@@ -901,7 +900,8 @@ class LoopedGPT(nn.Module):
                  num_heads: int, num_kv_heads: int, mlp_mult: float, lora_rank: int, mhc_streams: int,
                  tie_embeddings: bool, tied_embed_init_std: float, logit_softcap: float,
                  rope_base: float, qk_gain_init: float, mlp_type: str = "relu2",
-                 bigram_vocab_size: int = 0, bigram_dim: int = 128, ortho_lora: bool = False):
+                 bigram_vocab_size: int = 0, bigram_dim: int = 128, ortho_lora: bool = False,
+                 mhc_alpha: float = 0.01):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -934,7 +934,7 @@ class LoopedGPT(nn.Module):
                                 loras[li][bi].A.data = cols[:, li*lora_rank:(li+1)*lora_rank].clone()
         if mhc_streams == 4:
             self.stream_offsets = nn.Parameter(torch.randn(4, model_dim) * 0.01)
-            self.mhc = nn.ModuleList([mHCLite(model_dim, 4) for _ in range(num_unique_blocks)])
+            self.mhc = nn.ModuleList([mHCLite(model_dim, 4, alpha=mhc_alpha) for _ in range(num_unique_blocks)])
         self._init_weights(tied_embed_init_std)
 
     def _init_weights(self, std: float) -> None:
@@ -1019,7 +1019,7 @@ def build_model(args: Hyperparameters) -> nn.Module:
     if args.model_family == "looped":
         return LoopedGPT(num_unique_blocks=args.num_unique_blocks, num_loops=args.num_loops,
                          lora_rank=args.lora_rank, mhc_streams=args.mhc_streams,
-                         ortho_lora=args.ortho_lora, **common)
+                         ortho_lora=args.ortho_lora, mhc_alpha=args.mhc_alpha, **common)
     raise ValueError(f"Unknown MODEL_FAMILY={args.model_family!r}")
 
 def split_model_params(model: nn.Module):
