@@ -720,12 +720,12 @@ class mHCLite(nn.Module):
         n_perms = math.factorial(n_streams)
         self.res_proj = CastedLinear(n_streams * dim, n_perms, bias=False)
         self.pre_proj = CastedLinear(n_streams * dim, n_streams, bias=False)
-        # H_post: bottleneck projection — post_down zero-init (silent start),
-        # post_up gets orthogonal init from _init_weights (provides gradient path)
+        # H_post: bottleneck — both get orthogonal init, post_up scaled small
         post_rank = min(64, dim // 4)
         self.post_down = CastedLinear(dim, post_rank, bias=False)
-        self.post_down._zero_init = True  # output starts zero, gradients flow via nonzero post_up
         self.post_up = CastedLinear(post_rank, n_streams * dim, bias=False)
+        with torch.no_grad():
+            self.post_up.weight.mul_(0.01)  # small but nonzero — live gradients from step 1
         self.post_gate = CastedLinear(n_streams * dim, n_streams, bias=False)
         self.alpha_res = nn.Parameter(torch.tensor(0.01))
         self.alpha_pre = nn.Parameter(torch.tensor(0.01))
