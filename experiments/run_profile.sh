@@ -32,11 +32,17 @@ env $COMMON ITERATIONS=10 TRAIN_LOG_EVERY=1 VAL_LOSS_EVERY=0 \
   torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tee logs/profile_cuda.log
 
 echo ""
-echo "=========================================="
-echo "Profile complete."
-echo "  Graph breaks: logs/graph_breaks.log"
-echo "  CUDA trace:   profile_trace.json"
-echo "  Key averages: logs/profile_cuda.log"
 echo ""
-echo "To view trace: scp this:profile_trace.json local && chrome://tracing"
+echo "=========================================="
+echo "Step 3: Detailed per-component profiling"
+echo "=========================================="
+torchrun --standalone --nproc_per_node=1 experiments/detailed_profile.py 2>&1 | tee logs/detailed_profile.log
+
+echo ""
+echo "=========================================="
+echo "Profile complete. Files:"
+echo "  logs/graph_breaks.log      — compile breaks"
+echo "  logs/profile_cuda.log      — CUDA key averages"
+echo "  profile_trace.json         — chrome://tracing"
+echo "  logs/detailed_profile.log  — per-component timing"
 echo "=========================================="
