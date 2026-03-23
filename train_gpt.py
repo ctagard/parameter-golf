@@ -714,22 +714,6 @@ class LoRAAdapter(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return ((x @ self.A.to(x.dtype)) @ self.B.to(x.dtype)) * self.scale
 
-def _build_perm_matrices(n: int) -> Tensor:
-    from itertools import permutations
-    perms = list(permutations(range(n)))
-    P = torch.zeros(len(perms), n, n)
-    for i, perm in enumerate(perms):
-        for row, col in enumerate(perm):
-            P[i, row, col] = 1.0
-    return P
-
-_PERM4: Tensor | None = None
-def _get_perm4(device: torch.device) -> Tensor:
-    global _PERM4
-    if _PERM4 is None or _PERM4.device != device:
-        _PERM4 = _build_perm_matrices(4).to(device)
-    return _PERM4
-
 class mHCLite(nn.Module):
     def __init__(self, dim: int, n_streams: int = 4):
         super().__init__()
@@ -741,13 +725,21 @@ class mHCLite(nn.Module):
         self.alpha_res = nn.Parameter(torch.tensor(0.01))
         self.alpha_pre = nn.Parameter(torch.tensor(0.01))
         self.alpha_post = nn.Parameter(torch.tensor(0.01))
+        # Registered buffer — no global lookup, compile-clean
+        from itertools import permutations
+        perms = list(permutations(range(n_streams)))
+        P = torch.zeros(len(perms), n_streams, n_streams)
+        for i, perm in enumerate(perms):
+            for row, col in enumerate(perm):
+                P[i, row, col] = 1.0
+        self.register_buffer("perm_matrices", P, persistent=False)
 
     def forward(self, x_streams: Tensor, layer_output: Tensor) -> Tensor:
         B, T, n, D = x_streams.shape
         x_flat = F.rms_norm(x_streams.reshape(B, T, n * D), (n * D,))
         res_logits = self.alpha_res * self.res_proj(x_flat)
         res_weights = F.softmax(res_logits, dim=-1)
-        H_res = torch.einsum("btp,pij->btij", res_weights, _get_perm4(x_flat.device))
+        H_res = torch.einsum("btp,pij->btij", res_weights, self.perm_matrices)
         post_logits = self.alpha_post * self.post_proj(x_flat)
         H_post = 2.0 * torch.sigmoid(post_logits)
         x_res = torch.einsum("btij,btjd->btid", H_res, x_streams)
