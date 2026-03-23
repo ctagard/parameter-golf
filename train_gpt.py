@@ -39,7 +39,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# HYPERPARAMETERS
+# Default Simple Baseline run:
+# - 9 transformer blocks at width 512
 # - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
+# - vocab size 1024, sequence length 1024, tied embeddings
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
@@ -97,14 +101,18 @@ class Hyperparameters:
     mlp_type = os.environ.get("MLP_TYPE", "relu2").strip().lower()
     wandb_project = os.environ.get("WANDB_PROJECT", "")
     profile_step = int(os.environ.get("PROFILE_STEP", -1))  # -1=disabled, 0=profile first step after warmup
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 0))  # 0=disabled, 4096=recommended
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     muon_weight_decay = float(os.environ.get("MUON_WD", 0.0))
     adam_weight_decay = float(os.environ.get("ADAM_WD", 0.0))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # 0=standard eval, 64=sliding window
     quant_bits = int(os.environ.get("QUANT_BITS", 8))
+    ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 0))  # 0=disabled, 4=recommended
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0005))
     ttt_steps = int(os.environ.get("TTT_STEPS", 10))
+    prune_pct = float(os.environ.get("PRUNE_PCT", 0.0))  # 0=disabled, 0.03=3%
+    mhc_alpha = float(os.environ.get("MHC_ALPHA", 0.01))  # init for alpha_res/pre/post
 # MUON OPTIMIZER
 # 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
@@ -696,6 +704,7 @@ def make_mlp(dim: int, mlp_mult: int, mlp_type: str = "relu2") -> nn.Module:
 class LoRAAdapter(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, rank: int):
         super().__init__()
+        self.scale = float(rank ** 0.5) / rank  # alpha=sqrt(rank), fixed
         self.A = nn.Parameter(torch.randn(in_dim, rank) * 0.01)
         self.B = nn.Parameter(torch.zeros(rank, out_dim))
     def forward(self, x: Tensor) -> Tensor:
@@ -722,23 +731,14 @@ class mHCLite(nn.Module):
             for row, col in enumerate(perm):
                 P[i, row, col] = 1.0
         self.register_buffer("perm_matrices", P, persistent=False)
-        perm_idx = torch.tensor(perms, dtype=torch.int32)
-        self.register_buffer("perm_indices", perm_idx, persistent=False)
-
-    def _permute_mix(self, x_streams: Tensor, res_weights: Tensor) -> Tensor:
-        try:
-            from looped_gpt_kernels.kernels.mhc_permute import FusedPermuteMix
-            return FusedPermuteMix.apply(x_streams, res_weights, self.perm_indices)
-        except (ImportError, Exception):
-            H_res = torch.einsum("btp,pij->btij", res_weights, self.perm_matrices)
-            return torch.einsum("btij,btjd->btid", H_res, x_streams.float()).to(x_streams.dtype)
 
     def forward(self, x_streams: Tensor, layer_output: Tensor) -> Tensor:
         B, T, n, D = x_streams.shape
         x_flat = F.rms_norm(x_streams.reshape(B, T, n * D), (n * D,))
         res_logits = self.alpha_res * self.res_proj(x_flat)
         res_weights = F.softmax(res_logits, dim=-1)
-        x_res = self._permute_mix(x_streams, res_weights)
+        H_res = torch.einsum("btp,pij->btij", res_weights, self.perm_matrices)
+        x_res = torch.einsum("btij,btjd->btid", H_res, x_streams)
         post_content = self.post_content(layer_output).reshape(B, T, n, D)
         gate_vals = 2.0 * torch.sigmoid(self.alpha_post * self.post_gate(x_flat))
         x_post = gate_vals.unsqueeze(-1) * post_content
