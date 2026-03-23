@@ -387,10 +387,6 @@ def eval_val_ttt(args, model, rank, world_size, device, val_tokens,
     base_model.train()
     return val_loss, val_bpb
 # POST-TRAINING QUANTIZATION
-#
-# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -1189,7 +1185,11 @@ def main() -> None:
             module.inv_freq.data = module.inv_freq.data.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    # find_unused_parameters needed when LoRA A is frozen during warmup
+    ddp_kwargs = dict(device_ids=[local_rank], broadcast_buffers=False)
+    if args.lora_rank > 0 and args.lora_warmup_steps > 0:
+        ddp_kwargs["find_unused_parameters"] = True
+    model = DDP(compiled_model, **ddp_kwargs) if distributed else compiled_model
 
     tok_param, head_params, matrix_params, scalar_params, lora_a_params, lora_b_params = split_model_params(base_model)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
