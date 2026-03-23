@@ -343,3 +343,41 @@ All inter-loop cosine similarities are near zero (-0.024 to +0.042). **Loops nat
 2. Orthogonal SVD init provides marginal benefit (+0.013 BPB) over standard init
 3. At 200 steps on MLX, LoRA adds cost without improving BPB — needs longer training or CUDA validation
 4. Loop LoRA weights are naturally near-orthogonal — no diversity problem to solve
+
+---
+
+## A100 4-Way Ablation (1000 steps, PyTorch)
+
+**Date:** 2026-03-23
+**Setup:** 1×A100 SXM 80GB, batch=131072, 1000 steps, val every 200 steps. All with table-stakes (SmearGate, OrthoInit, WD where applicable).
+
+### Results (runs 1-2 complete, runs 3-4 pending)
+
+| Config | Params | Compressed | Step 200 | Step 600 | Step 1000 | int8 BPB | ms/step |
+|--------|--------|-----------|----------|----------|-----------|----------|---------|
+| **Baseline** (9L dim=512) | 17.1M | 12.6MB | 1.8166 | 1.5326 | **1.4414** | **1.4424** | **280** |
+| **Looped** (3×3 dim=768, no LoRA) | 22.4M | 16.1MB⚠️ | 1.8066 | 1.5528 | 1.4535 | 1.4555 | 776 |
+
+### Critical Issues
+
+1. **Baseline WINS by 0.012 BPB** at 1000 steps despite 31% fewer params. The looped architecture is not better at equal step count.
+
+2. **Compressed size 16.1MB — OVER 16MB LIMIT.** MLP_MULT=3 at dim=768 is too big for int8+zlib. Must use int6+zstd (QUANT_BITS=6) or reduce MLP_MULT.
+
+3. **2.8× slower per step** (776ms vs 280ms). At equal wallclock (10 min H100), baseline gets 3.6× more training steps, making the gap much worse.
+
+4. **mHC is 29% of forward time** — profiling showed mHC einsum over permutation matrices is memory-bandwidth bound, much slower than FLOP estimates.
+
+### Analysis
+
+The looped architecture's theoretical advantage (param efficiency → wider model) is being eaten by:
+- **Speed penalty:** 3 loops × 3 blocks = 9 effective attention passes vs baseline's 9 independent blocks, but with mHC overhead on top
+- **mHC cost:** 29% of forward for multi-stream mixing that hasn't shown clear BPB benefit at this training scale
+- **Model size:** MLP_MULT=3 pushes compressed size over 16MB
+
+### Open Questions
+
+- Will LoRA (runs 3-4) close the gap? Prior MLX results suggest no at 200 steps, but 1000 steps gives more time for adapters to contribute.
+- Should we drop mHC entirely? It's 29% of forward time for unclear benefit.
+- Is dim=768 + MLP_MULT=3 the wrong size? Could dim=640 + MLP_MULT=2 be faster and under 16MB?
+- At equal wallclock, can the looped architecture ever beat baseline given the speed gap?
