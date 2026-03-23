@@ -746,8 +746,8 @@ class mHCLite(nn.Module):
         x_res = torch.einsum("btij,btjd->btid", H_res, x_streams)
         # H_post: each stream gets unique projection of layer_output, gated
         post_content = self.post_content(layer_output).reshape(B, T, n, D)
-        post_gate = 2.0 * torch.sigmoid(self.alpha_post * self.post_gate(x_flat))
-        x_post = post_gate.unsqueeze(-1) * post_content
+        gate_vals = 2.0 * torch.sigmoid(self.alpha_post * self.post_gate(x_flat))
+        x_post = gate_vals.unsqueeze(-1) * post_content
         return x_res + x_post
 
     def mix_to_one(self, x_streams: Tensor) -> Tensor:
