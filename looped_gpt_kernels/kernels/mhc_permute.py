@@ -25,61 +25,42 @@ if HAS_TRITON:
     @triton.jit
     def _mhc_permute_fwd(
         x_ptr, w_ptr, perm_ptr, out_ptr,
-        B, T: tl.constexpr, n: tl.constexpr, D: tl.constexpr,
-        n_perms: tl.constexpr,
-        stride_x_bt, stride_x_n, stride_x_d,
-        stride_w_bt, stride_w_p,
-        stride_o_bt, stride_o_n, stride_o_d,
+        n: tl.constexpr, D: tl.constexpr, n_perms: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
         bt = tl.program_id(0)
         i = tl.program_id(1)
-
         d_offs = tl.arange(0, BLOCK_D)
         d_mask = d_offs < D
-
         acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-
+        x_bt_base = bt * n * D
         for p in range(n_perms):
-            w = tl.load(w_ptr + bt * stride_w_bt + p * stride_w_p)
+            w = tl.load(w_ptr + bt * n_perms + p)
             j = tl.load(perm_ptr + p * n + i)
-            x = tl.load(x_ptr + bt * stride_x_bt + j * stride_x_n + d_offs * stride_x_d,
-                        mask=d_mask, other=0.0).to(tl.float32)
+            x = tl.load(x_ptr + x_bt_base + j * D + d_offs, mask=d_mask, other=0.0).to(tl.float32)
             acc += w * x
-
-        tl.store(out_ptr + bt * stride_o_bt + i * stride_o_n + d_offs * stride_o_d,
-                 acc.to(tl.bfloat16), mask=d_mask)
+        tl.store(out_ptr + x_bt_base + i * D + d_offs, acc.to(tl.bfloat16), mask=d_mask)
 
     @triton.jit
     def _mhc_permute_bwd_x(
         grad_out_ptr, w_ptr, perm_ptr, grad_x_ptr,
-        B, T: tl.constexpr, n: tl.constexpr, D: tl.constexpr,
-        n_perms: tl.constexpr,
-        stride_g_bt, stride_g_n, stride_g_d,
-        stride_w_bt, stride_w_p,
-        stride_gx_bt, stride_gx_n, stride_gx_d,
+        n: tl.constexpr, D: tl.constexpr, n_perms: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
-        """Backward w.r.t. x_streams: grad_x[b,t,j,d] = sum_p w[b,t,p] * sum_i(perm[p,i]==j) * grad_out[b,t,i,d]"""
         bt = tl.program_id(0)
-        j = tl.program_id(1)  # source stream index
-
+        j = tl.program_id(1)
         d_offs = tl.arange(0, BLOCK_D)
         d_mask = d_offs < D
         acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-
+        g_bt_base = bt * n * D
         for p in range(n_perms):
-            w = tl.load(w_ptr + bt * stride_w_bt + p * stride_w_p)
-            # Find which output stream i this source j maps to under perm p
+            w = tl.load(w_ptr + bt * n_perms + p)
             for i in range(n):
                 perm_j = tl.load(perm_ptr + p * n + i)
                 if perm_j == j:
-                    g = tl.load(grad_out_ptr + bt * stride_g_bt + i * stride_g_n + d_offs * stride_g_d,
-                                mask=d_mask, other=0.0).to(tl.float32)
+                    g = tl.load(grad_out_ptr + g_bt_base + i * D + d_offs, mask=d_mask, other=0.0).to(tl.float32)
                     acc += w * g
-
-        tl.store(grad_x_ptr + bt * stride_gx_bt + j * stride_gx_n + d_offs * stride_gx_d,
-                 acc.to(tl.bfloat16), mask=d_mask)
+        tl.store(grad_x_ptr + g_bt_base + j * D + d_offs, acc.to(tl.bfloat16), mask=d_mask)
 
 
 class FusedPermuteMix(torch.autograd.Function):
@@ -87,21 +68,16 @@ class FusedPermuteMix(torch.autograd.Function):
     def forward(ctx, x_streams, res_weights, perm_indices):
         B, T, n, D = x_streams.shape
         n_perms = res_weights.shape[-1]
-        out = torch.empty_like(x_streams)
+        x_flat = x_streams.contiguous().reshape(B * T, n, D)
+        w_flat = res_weights.contiguous().reshape(B * T, n_perms)
+        out_flat = torch.empty_like(x_flat)
         BLOCK_D = triton.next_power_of_2(D)
-        grid = (B * T, n)
-
-        _mhc_permute_fwd[grid](
-            x_streams, res_weights, perm_indices, out,
-            B, T, n, D, n_perms,
-            x_streams.stride(0) * x_streams.stride(1) // max(x_streams.stride(1), 1),
-            *x_streams.stride()[1:],
-            *res_weights.stride(),
-            *out.stride()[1:],
-            BLOCK_D=BLOCK_D,
+        _mhc_permute_fwd[(B * T, n)](
+            x_flat, w_flat, perm_indices, out_flat,
+            n, D, n_perms, BLOCK_D=BLOCK_D,
         )
         ctx.save_for_backward(x_streams, res_weights, perm_indices)
-        return out
+        return out_flat.reshape(B, T, n, D)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -109,24 +85,17 @@ class FusedPermuteMix(torch.autograd.Function):
         B, T, n, D = x_streams.shape
         n_perms = res_weights.shape[-1]
         BLOCK_D = triton.next_power_of_2(D)
-
-        # grad w.r.t. x_streams
-        grad_x = torch.zeros_like(x_streams)
+        g_flat = grad_out.contiguous().reshape(B * T, n, D)
+        w_flat = res_weights.contiguous().reshape(B * T, n_perms)
+        grad_x_flat = torch.zeros(B * T, n, D, device=g_flat.device, dtype=g_flat.dtype)
         _mhc_permute_bwd_x[(B * T, n)](
-            grad_out, res_weights, perm_indices, grad_x,
-            B, T, n, D, n_perms,
-            *grad_out.stride()[1:],
-            *res_weights.stride(),
-            *grad_x.stride()[1:],
-            BLOCK_D=BLOCK_D,
+            g_flat, w_flat, perm_indices, grad_x_flat,
+            n, D, n_perms, BLOCK_D=BLOCK_D,
         )
-
-        # grad w.r.t. res_weights: simple PyTorch for now
-        # grad_w[b,t,p] = sum_i sum_d grad_out[b,t,i,d] * x_streams[b,t,perm[p,i],d]
+        # grad w.r.t. res_weights: PyTorch fallback
         grad_w = torch.zeros_like(res_weights)
         perm_np = perm_indices.cpu()
         for p in range(n_perms):
-            gathered = x_streams[:, :, perm_np[p].long(), :]  # (B,T,n,D)
+            gathered = x_streams[:, :, perm_np[p].long(), :]
             grad_w[:, :, p] = (grad_out * gathered).sum(dim=(-1, -2))
-
-        return grad_x, grad_w, None
+        return grad_x_flat.reshape(B, T, n, D), grad_w, None
