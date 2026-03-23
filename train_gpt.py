@@ -101,7 +101,6 @@ class Hyperparameters:
     mlp_type = os.environ.get("MLP_TYPE", "relu2").strip().lower()
     wandb_project = os.environ.get("WANDB_PROJECT", "")
     profile_step = int(os.environ.get("PROFILE_STEP", -1))  # -1=disabled, 0=profile first step after warmup
-
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 0))  # 0=disabled, 4096=recommended
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     muon_weight_decay = float(os.environ.get("MUON_WD", 0.0))
@@ -116,7 +115,6 @@ class Hyperparameters:
     mhc_alpha = float(os.environ.get("MHC_ALPHA", 0.01))  # init for alpha_res/pre/post
 # MUON OPTIMIZER
 # 
-
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
@@ -135,7 +133,6 @@ class Muon(torch.optim.Optimizer):
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay),
         )
-
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -218,7 +215,6 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
-    # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
     if usable <= 0:
@@ -343,7 +339,6 @@ def eval_val_ttt(args, model, rank, world_size, device, val_tokens,
         lora_A.requires_grad_(True)
         lora_B.requires_grad_(True)
         opt = torch.optim.AdamW([lora_A, lora_B], lr=args.ttt_lora_lr, weight_decay=0.0)
-        # TTT: recompute hidden each step so encoder gradients flow through LoRA
         for _ in range(ttt_steps):
             opt.zero_grad()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -405,6 +400,22 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
+def pack_int6(arr: np.ndarray) -> np.ndarray:
+    """Pack int6 values (-31..31) into 3 bytes per 4 values (25% smaller than int8)."""
+    t = (arr.astype(np.int32).flatten() + 32).astype(np.uint8)
+    pad = (4 - len(t) % 4) % 4
+    if pad:
+        t = np.append(t, np.zeros(pad, dtype=np.uint8))
+    a, b, c, d = t[0::4], t[1::4], t[2::4], t[3::4]
+    return np.stack([(a << 2) | (b >> 4), ((b & 0xF) << 4) | (c >> 2), ((c & 0x3) << 6) | d], axis=1).flatten().astype(np.uint8)
+
+def unpack_int6(packed: np.ndarray, numel: int) -> np.ndarray:
+    """Unpack 3-bytes-per-4-values back to int8."""
+    b0, b1, b2 = packed[0::3].astype(np.int32), packed[1::3].astype(np.int32), packed[2::3].astype(np.int32)
+    vals = np.stack([(b0 >> 2) & 0x3F, ((b0 & 0x3) << 4) | ((b1 >> 4) & 0xF),
+                     ((b1 & 0xF) << 2) | ((b2 >> 6) & 0x3), b2 & 0x3F], axis=1).flatten()
+    return (vals[:numel] - 32).astype(np.int8)
+
 def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     clip_val = 2 ** (bits - 1) - 1
     t32 = t.float()
@@ -457,12 +468,21 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8):
 
         stats["num_float_tensors"] += 1
         q, s = quantize_float_tensor(t, bits=bits)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = q
+        meta = {"scheme": "per_row", "axis": 0} if s.ndim > 0 else {}
+        if bits == 6:
+            packed = pack_int6(q.numpy())
+            quantized[name] = torch.from_numpy(packed)
+            meta["packing"] = "int6_4x3"
+            meta["original_shape"] = list(q.shape)
+            meta["original_numel"] = int(q.numel())
+            stats["int8_payload_bytes"] += len(packed) + tensor_nbytes(s)
+        else:
+            quantized[name] = q
+            stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+        if meta:
+            qmeta[name] = meta
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
     obj: dict[str, object] = {
         "__quant_format__": "int8_clean_per_row_v1",
@@ -484,15 +504,16 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        meta = qmeta.get(name, {})
+        # Unpack int6 if needed
+        if meta.get("packing") == "int6_4x3":
+            q = torch.from_numpy(unpack_int6(q.numpy(), meta["original_numel"]).reshape(meta["original_shape"]))
+        if meta.get("scheme") == "per_row" or s.ndim > 0:
             s = s.to(dtype=torch.float32)
-            # Broadcast the saved row scale back across trailing dimensions.
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
-            scale = float(s.item())
-            out[name] = (q.float() * scale).to(dtype=dtype).contiguous()
+            out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
-        # Restore small tensors, undoing the temporary fp16 storage cast if needed.
         out_t = t.detach().to("cpu").contiguous()
         orig_dtype = passthrough_orig_dtypes.get(name)
         if isinstance(orig_dtype, str):
@@ -504,7 +525,6 @@ def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
     token_bytes = np.dtype("<u2").itemsize
     header = np.fromfile(file, dtype="<i4", count=256)
-    # SHARD HEADER INTS & SHARD_MAGIC
     if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
         raise ValueError(f"Unexpected shard header for {file}")
     num_tokens = int(header[2])
@@ -516,8 +536,6 @@ def load_data_shard(file: Path) -> Tensor:
         raise ValueError(f"Short read for {file}")
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 class TokenStream:
-    # Reads shards sequentially and wraps around forever. The training loop therefore
-    # has deterministic, simple streaming behavior with no sampling or workers.
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
@@ -545,8 +563,6 @@ class TokenStream:
             remaining -= k
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 class DistributedTokenLoader:
-    # Each call consumes a contiguous chunk from the shared token stream, then slices out
-    # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
     def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
         self.rank = rank
         self.world_size = world_size
@@ -570,12 +586,10 @@ class RMSNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
             if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
@@ -725,7 +739,6 @@ class mHCLite(nn.Module):
         res_weights = F.softmax(res_logits, dim=-1)
         H_res = torch.einsum("btp,pij->btij", res_weights, self.perm_matrices)
         x_res = torch.einsum("btij,btjd->btid", H_res, x_streams)
-        # H_post: each stream gets unique projection of layer_output, gated
         post_content = self.post_content(layer_output).reshape(B, T, n, D)
         gate_vals = 2.0 * torch.sigmoid(self.alpha_post * self.post_gate(x_flat))
         x_post = gate_vals.unsqueeze(-1) * post_content
@@ -1077,7 +1090,6 @@ def main() -> None:
         dist.barrier()
     master_process = rank == 0
 
-    # Fast math knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
@@ -1162,7 +1174,6 @@ def main() -> None:
             module.inv_freq.data = module.inv_freq.data.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    # find_unused_parameters needed when LoRA A is frozen during warmup
     ddp_kwargs = dict(device_ids=[local_rank], broadcast_buffers=False)
     if args.lora_rank > 0 and args.lora_warmup_steps > 0:
         ddp_kwargs["find_unused_parameters"] = True
@@ -1173,20 +1184,17 @@ def main() -> None:
     optimizer_tok = torch.optim.AdamW(
         [{"params": [tok_param], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=args.adam_weight_decay, fused=True)
-    # LoRA A goes to Muon alongside base weights, but frozen during warmup
     all_muon_params = matrix_params + lora_a_params
     optimizer_muon = Muon(all_muon_params, lr=args.matrix_lr, momentum=args.muon_momentum,
                           backend_steps=args.muon_backend_steps, weight_decay=args.muon_weight_decay)
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    # Freeze LoRA A for warmup — will unfreeze in training loop
     for p in lora_a_params:
         p.requires_grad_(False)
     optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2), eps=args.adam_eps, weight_decay=args.adam_weight_decay, fused=True)
     optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    # LoRA B: separate Adam at 0.1x scalar_lr
     if lora_b_params:
         lora_b_lr = args.scalar_lr * 0.1
         optimizer_lora_b = torch.optim.AdamW(
@@ -1317,13 +1325,11 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        # LoRA A unfreeze: after warmup, enable gradients (Muon buffers init lazily on first step)
         if args.lora_rank > 0 and step == args.lora_warmup_steps and lora_a_params:
             for p in lora_a_params:
                 p.requires_grad_(True)
             log0(f"lora_A_unfrozen at step {step}")
         zero_grad_all()
-        # Optional profiling of a single step
         do_profile = (args.profile_step >= 0 and step == args.profile_step)
         prof_ctx = torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
