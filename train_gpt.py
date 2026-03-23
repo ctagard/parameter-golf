@@ -122,8 +122,6 @@ class Hyperparameters:
 
 # MUON OPTIMIZER
 # 
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
@@ -198,7 +196,6 @@ class Muon(torch.optim.Optimizer):
                 curr += p.numel()
 
         return loss
-# TOKENIZER-AGNOSTIC EVALUATION SETUP
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -386,7 +383,6 @@ def eval_val_ttt(args, model, rank, world_size, device, val_tokens,
     val_bpb = (loss_sum / math.log(2.0)) / max(byte_sum, 1.0)
     base_model.train()
     return val_loss, val_bpb
-# POST-TRAINING QUANTIZATION
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -521,7 +517,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
     return out
-# DATA LOADING 
 
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
@@ -585,9 +580,6 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-
-# TRANSFORMER MODULES
-
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
         super().__init__()
@@ -819,13 +811,11 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, q_delta_fn=None, v_delta_fn=None) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, q_delta: Tensor | None = None, v_delta: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         n = self.attn_norm(x)
-        qd = q_delta_fn(n) if q_delta_fn is not None else None
-        vd = v_delta_fn(n) if v_delta_fn is not None else None
-        attn_out = self.attn(n, qd, vd)
+        attn_out = self.attn(n, q_delta, v_delta)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -997,8 +987,14 @@ class LoopedGPT(nn.Module):
                 ls = self.loop_emb[loop_idx].to(x.dtype)
                 for bi, block in enumerate(self.blocks):
                     x_in = self.mhc[bi].mix_to_one(x_s) + ls
-                    qd = self.loop_lora_q[loop_idx][bi] if self.lora_rank > 0 else None
-                    vd = self.loop_lora_v[loop_idx][bi] if self.lora_rank > 0 else None
+                    # Compute LoRA deltas as tensors (no callables — compile-clean)
+                    if self.lora_rank > 0:
+                        mix = block.resid_mix.to(dtype=x_in.dtype)
+                        n = block.attn_norm(mix[0][None,None,:] * x_in + mix[1][None,None,:] * x0)
+                        qd = self.loop_lora_q[loop_idx][bi](n)
+                        vd = self.loop_lora_v[loop_idx][bi](n)
+                    else:
+                        qd, vd = None, None
                     block_out = block(x_in, x0, qd, vd)
                     x_s = self.mhc[bi](x_s, block_out)
             x = x_s.mean(dim=2)
@@ -1007,8 +1003,13 @@ class LoopedGPT(nn.Module):
                 ls = self.loop_emb[loop_idx].to(x.dtype)
                 for bi, block in enumerate(self.blocks):
                     x_in = x + ls
-                    qd = self.loop_lora_q[loop_idx][bi] if self.lora_rank > 0 else None
-                    vd = self.loop_lora_v[loop_idx][bi] if self.lora_rank > 0 else None
+                    if self.lora_rank > 0:
+                        mix = block.resid_mix.to(dtype=x_in.dtype)
+                        n = block.attn_norm(mix[0][None,None,:] * x_in + mix[1][None,None,:] * x0)
+                        qd = self.loop_lora_q[loop_idx][bi](n)
+                        vd = self.loop_lora_v[loop_idx][bi](n)
+                    else:
+                        qd, vd = None, None
                     x = block(x_in, x0, qd, vd)
         return self.final_norm(x)
 
@@ -1067,9 +1068,6 @@ def split_model_params(model: nn.Module):
         else:
             scalar_params.append(p)
     return tok_param, head_params, matrix_params, scalar_params, lora_a_params, lora_b_params
-
-# TRAINING
-
 def main() -> None:
     global zeropower_via_newtonschulz5
 

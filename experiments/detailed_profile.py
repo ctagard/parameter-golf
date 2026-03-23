@@ -175,10 +175,12 @@ def main():
         x_s = x_norm.unsqueeze(2).expand(B, T, 4, D).contiguous()
         block_out = x_norm.clone()
         def mhc_mix():
-            model.mhc[0](x_s, block_out)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                model.mhc[0](x_s, block_out)
         cuda_timer(mhc_mix, label="mHC mix (forward)")
         def mhc_pool():
-            model.mhc[0].mix_to_one(x_s)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                model.mhc[0].mix_to_one(x_s)
         cuda_timer(mhc_pool, label="mHC mix_to_one")
         print(f"  {'mHC total (3 blocks × 3 loops × 2 ops)':40s} ≈ estimated from above")
 
