@@ -720,9 +720,12 @@ class mHCLite(nn.Module):
         n_perms = math.factorial(n_streams)
         self.res_proj = CastedLinear(n_streams * dim, n_perms, bias=False)
         self.pre_proj = CastedLinear(n_streams * dim, n_streams, bias=False)
-        # H_post: project layer output into n different directions per stream
-        self.post_content = CastedLinear(dim, n_streams * dim, bias=False)
-        self.post_content._zero_init = True
+        # H_post: bottleneck projection — post_down zero-init (silent start),
+        # post_up gets orthogonal init from _init_weights (provides gradient path)
+        post_rank = min(64, dim // 4)
+        self.post_down = CastedLinear(dim, post_rank, bias=False)
+        self.post_down._zero_init = True  # output starts zero, gradients flow via nonzero post_up
+        self.post_up = CastedLinear(post_rank, n_streams * dim, bias=False)
         self.post_gate = CastedLinear(n_streams * dim, n_streams, bias=False)
         self.alpha_res = nn.Parameter(torch.tensor(0.01))
         self.alpha_pre = nn.Parameter(torch.tensor(0.01))
@@ -743,7 +746,7 @@ class mHCLite(nn.Module):
         H_res = torch.einsum("btp,pij->btij", res_weights, self.perm_matrices)
         x_res = torch.einsum("btij,btjd->btid", H_res, x_streams)
         # H_post: each stream gets unique projection of layer_output, gated
-        post_content = self.post_content(layer_output).reshape(B, T, n, D)
+        post_content = self.post_up(F.silu(self.post_down(layer_output))).reshape(B, T, n, D)
         gate_vals = 2.0 * torch.sigmoid(self.alpha_post * self.post_gate(x_flat))
         x_post = gate_vals.unsqueeze(-1) * post_content
         return x_res + x_post
