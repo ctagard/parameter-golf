@@ -47,7 +47,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
 
 class Hyperparameters:
-    # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
@@ -55,12 +54,10 @@ class Hyperparameters:
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
-    # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
-    # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
@@ -69,7 +66,6 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
-    # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -80,7 +76,6 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
@@ -96,7 +91,6 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-    # Architecture selection.
     model_family = os.environ.get("MODEL_FAMILY", "baseline").strip().lower()
     num_unique_blocks = int(os.environ.get("NUM_UNIQUE_BLOCKS", 3))
     num_loops = int(os.environ.get("NUM_LOOPS", 3))
@@ -108,7 +102,6 @@ class Hyperparameters:
     wandb_project = os.environ.get("WANDB_PROJECT", "")
     profile_step = int(os.environ.get("PROFILE_STEP", -1))  # -1=disabled, 0=profile first step after warmup
 
-    # Table-stakes modifications.
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 0))  # 0=disabled, 4096=recommended
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     muon_weight_decay = float(os.environ.get("MUON_WD", 0.0))
@@ -117,15 +110,14 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # 0=standard eval, 64=sliding window
     quant_bits = int(os.environ.get("QUANT_BITS", 8))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 0))  # 0=disabled, 4=recommended
-    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0005))  # record uses 0.0005
-    ttt_steps = int(os.environ.get("TTT_STEPS", 10))  # record uses 10 epochs
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0005))
+    ttt_steps = int(os.environ.get("TTT_STEPS", 10))
+    prune_pct = float(os.environ.get("PRUNE_PCT", 0.0))  # 0=disabled, 0.03=3%
 
 # MUON OPTIMIZER
 # 
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -244,9 +236,6 @@ def eval_val(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
@@ -436,11 +425,6 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8):
-    # Single supported clean-script export format:
-    # - per-row int8 for 2D float tensors
-    # - per-tensor int8 for other float tensors
-    # - exact passthrough for non-floats
-    # - passthrough for small float tensors, stored as fp16 to save bytes
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
@@ -720,10 +704,9 @@ class mHCLite(nn.Module):
         n_perms = math.factorial(n_streams)
         self.res_proj = CastedLinear(n_streams * dim, n_perms, bias=False)
         self.pre_proj = CastedLinear(n_streams * dim, n_streams, bias=False)
-        # H_post: bottleneck — post_proj gets muP scaling from _init_weights (.proj in name)
-        post_rank = min(64, dim // 4)
-        self.post_down = CastedLinear(dim, post_rank, bias=False)
-        self.post_proj = CastedLinear(post_rank, n_streams * dim, bias=False)
+        # H_post: project layer output into n different directions per stream
+        self.post_content = CastedLinear(dim, n_streams * dim, bias=False)
+        self.post_content._zero_init = True
         self.post_gate = CastedLinear(n_streams * dim, n_streams, bias=False)
         self.alpha_res = nn.Parameter(torch.tensor(0.01))
         self.alpha_pre = nn.Parameter(torch.tensor(0.01))
@@ -744,7 +727,7 @@ class mHCLite(nn.Module):
         H_res = torch.einsum("btp,pij->btij", res_weights, self.perm_matrices)
         x_res = torch.einsum("btij,btjd->btid", H_res, x_streams)
         # H_post: each stream gets unique projection of layer_output, gated
-        post_content = self.post_proj(F.silu(self.post_down(layer_output))).reshape(B, T, n, D)
+        post_content = self.post_content(layer_output).reshape(B, T, n, D)
         gate_vals = 2.0 * torch.sigmoid(self.alpha_post * self.post_gate(x_flat))
         x_post = gate_vals.unsqueeze(-1) * post_content
         return x_res + x_post
@@ -1435,6 +1418,24 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
+    if args.prune_pct > 0:
+        with torch.no_grad():
+            all_weights = []
+            for name, p in base_model.named_parameters():
+                if p.ndim == 2 and p.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
+                    all_weights.append(p.data.abs().flatten())
+            if all_weights:
+                all_abs = torch.cat(all_weights)
+                sample = all_abs[torch.randperm(len(all_abs), device=all_abs.device)[:min(1_000_000, len(all_abs))]]
+                idx = int(len(sample) * args.prune_pct)
+                threshold = float(sample.float().sort().values[idx].item())
+                pruned = 0
+                for name, p in base_model.named_parameters():
+                    if p.ndim == 2 and p.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
+                        mask = p.data.abs() < threshold
+                        pruned += mask.sum().item()
+                        p.data[mask] = 0.0
+                log0(f"pruning: zeroed {pruned:,} weights ({100*pruned/all_abs.numel():.1f}%) threshold:{threshold:.6f}")
     quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), bits=args.quant_bits)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
