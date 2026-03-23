@@ -117,8 +117,8 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # 0=standard eval, 64=sliding window
     quant_bits = int(os.environ.get("QUANT_BITS", 8))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 0))  # 0=disabled, 4=recommended
-    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.03))
-    ttt_steps = int(os.environ.get("TTT_STEPS", 3))
+    ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.0005))  # record uses 0.0005
+    ttt_steps = int(os.environ.get("TTT_STEPS", 10))  # record uses 10 epochs
 
 # MUON OPTIMIZER
 # 
@@ -331,7 +331,7 @@ def eval_val_sliding(args, model, rank, world_size, device, val_tokens,
     return val_loss, val_bpb
 def eval_val_ttt(args, model, rank, world_size, device, val_tokens,
                  base_bytes_lut, has_leading_space_lut, is_boundary_token_lut):
-    """Test-time training: adapt small LoRA on lm_head per document chunk before scoring."""
+    """Test-time training: per-document AdamW LoRA on lm_head with recomputed hiddens."""
     torch._dynamo.reset()
     base_model = model.module if hasattr(model, 'module') else model
     base_model.eval()
@@ -349,24 +349,22 @@ def eval_val_ttt(args, model, rank, world_size, device, val_tokens,
             break
         chunk = val_tokens[doc_start:doc_start + seq_len + 1].to(dtype=torch.int64, device=device)
         x, y = chunk[:-1].unsqueeze(0), chunk[1:].unsqueeze(0)
-        # Create per-document LoRA: hidden → rank → vocab
         lora_A = torch.randn(dim, ttt_rank, device=device, dtype=torch.float32) * 0.01
         lora_B = torch.zeros(ttt_rank, vocab, device=device, dtype=torch.float32)
         lora_A.requires_grad_(True)
         lora_B.requires_grad_(True)
-        opt = torch.optim.SGD([lora_A, lora_B], lr=args.ttt_lora_lr)
-        # Train LoRA for a few steps on this document
-        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            hidden = base_model.encode(x)  # [1, T, D] — frozen
+        opt = torch.optim.AdamW([lora_A, lora_B], lr=args.ttt_lora_lr, weight_decay=0.0)
+        # TTT: recompute hidden each step so encoder gradients flow through LoRA
         for _ in range(ttt_steps):
             opt.zero_grad()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                hidden = base_model.encode(x)
                 logits = base_model.decode(hidden) + (hidden @ lora_A.to(hidden.dtype)) @ lora_B.to(hidden.dtype)
             loss = F.cross_entropy(logits.float().reshape(-1, vocab), y.reshape(-1))
             loss.backward()
             opt.step()
-        # Score with adapted model
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            hidden = base_model.encode(x)
             logits = base_model.decode(hidden) + (hidden @ lora_A.to(hidden.dtype)) @ lora_B.to(hidden.dtype)
         per_tok_loss = F.cross_entropy(logits.float().reshape(-1, vocab), y.reshape(-1), reduction='none')
         loss_sum += per_tok_loss.sum().item()
