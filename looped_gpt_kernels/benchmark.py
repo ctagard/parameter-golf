@@ -35,7 +35,7 @@ if __name__ == "__main__":
     print("=== Permute Mix ===")
     def pytorch_permute():
         H = torch.einsum("btp,pij->btij", res_weights, perm_mat)
-        return torch.einsum("btij,btjd->btid", H, x_streams)
+        return torch.einsum("btij,btjd->btid", H, x_streams.float()).to(x_streams.dtype)
 
     t_base = bench(pytorch_permute, label="PyTorch einsum")
 
