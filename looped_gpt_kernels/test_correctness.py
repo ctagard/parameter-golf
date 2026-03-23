@@ -26,7 +26,7 @@ def test_permute_mix():
     perm_idx, perm_mat = _make_perm_data(n)
 
     ref = torch.einsum("btij,btjd->btid",
-                       torch.einsum("btp,pij->btij", w, perm_mat), x)
+                       torch.einsum("btp,pij->btij", w, perm_mat), x.float()).to(x.dtype)
     out = FusedPermuteMix.apply(x, w, perm_idx)
     diff = (ref.float() - out.float()).abs().max().item()
     assert diff < 0.05, f"permute_mix max diff: {diff}"
