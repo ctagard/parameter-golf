@@ -718,14 +718,17 @@ class mHCLite(nn.Module):
     def __init__(self, dim: int, n_streams: int = 4):
         super().__init__()
         self.n = n_streams
+        self.dim = dim
         n_perms = math.factorial(n_streams)
         self.res_proj = CastedLinear(n_streams * dim, n_perms, bias=False)
         self.pre_proj = CastedLinear(n_streams * dim, n_streams, bias=False)
-        self.post_proj = CastedLinear(n_streams * dim, n_streams, bias=False)
+        # H_post: project layer output into n different directions (not just scale)
+        self.post_content = CastedLinear(dim, n_streams * dim, bias=False)
+        self.post_content._zero_init = True
+        self.post_gate = CastedLinear(n_streams * dim, n_streams, bias=False)
         self.alpha_res = nn.Parameter(torch.tensor(0.01))
         self.alpha_pre = nn.Parameter(torch.tensor(0.01))
         self.alpha_post = nn.Parameter(torch.tensor(0.01))
-        # Registered buffer — no global lookup, compile-clean
         from itertools import permutations
         perms = list(permutations(range(n_streams)))
         P = torch.zeros(len(perms), n_streams, n_streams)
@@ -740,10 +743,11 @@ class mHCLite(nn.Module):
         res_logits = self.alpha_res * self.res_proj(x_flat)
         res_weights = F.softmax(res_logits, dim=-1)
         H_res = torch.einsum("btp,pij->btij", res_weights, self.perm_matrices)
-        post_logits = self.alpha_post * self.post_proj(x_flat)
-        H_post = 2.0 * torch.sigmoid(post_logits)
         x_res = torch.einsum("btij,btjd->btid", H_res, x_streams)
-        x_post = H_post.unsqueeze(-1) * layer_output.unsqueeze(2)
+        # H_post: each stream gets unique projection of layer_output, gated
+        post_content = self.post_content(layer_output).reshape(B, T, n, D)
+        post_gate = 2.0 * torch.sigmoid(self.alpha_post * self.post_gate(x_flat))
+        x_post = post_gate.unsqueeze(-1) * post_content
         return x_res + x_post
 
     def mix_to_one(self, x_streams: Tensor) -> Tensor:
