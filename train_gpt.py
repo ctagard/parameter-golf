@@ -388,7 +388,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,loop_emb,alpha_res,alpha_pre,alpha_post,smear,bigram",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,loop_emb,alpha_res,alpha_pre,alpha_post,smear,bigram,stream_offsets",
     ).split(",")
     if pattern
 )
@@ -947,6 +947,7 @@ class LoopedGPT(nn.Module):
                             for li in range(num_loops):
                                 loras[li][bi].A.data = cols[:, li*lora_rank:(li+1)*lora_rank].clone()
         if mhc_streams == 4:
+            self.stream_offsets = nn.Parameter(torch.randn(4, model_dim) * 0.01)
             self.mhc = nn.ModuleList([mHCLite(model_dim, 4) for _ in range(num_unique_blocks)])
         self._init_weights(tied_embed_init_std)
 
@@ -974,7 +975,7 @@ class LoopedGPT(nn.Module):
         x0 = x
         if self.mhc_streams == 4:
             B, T, D = x.shape
-            x_s = x.unsqueeze(2).expand(B, T, 4, D)
+            x_s = x.unsqueeze(2).expand(B, T, 4, D) + self.stream_offsets[None, None, :, :]
             for loop_idx in range(self.num_loops):
                 ls = self.loop_emb[loop_idx].to(x.dtype)
                 for bi, block in enumerate(self.blocks):
