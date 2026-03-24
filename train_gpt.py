@@ -322,12 +322,12 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8):
-    bits = 6
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
     dtypes: dict[str, str] = {}
     passthrough: dict[str, Tensor] = {}
     passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict] = {}
     stats = dict.fromkeys(
         ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"), 0)
     for name, tensor in state_dict.items():
@@ -353,26 +353,38 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8):
         stats["num_float_tensors"] += 1
         q, s = quantize_float_tensor(t, bits=bits)
         meta = {"scheme": "per_row", "axis": 0} if s.ndim > 0 else {}
-        quantized[name] = q
-        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
-        if meta:
-            pass  # stored inline
+        if bits == 6:
+            packed = pack_int6(q.numpy())
+            quantized[name] = torch.from_numpy(packed)
+            meta["packing"] = "int6_4x3"
+            meta["original_shape"] = list(q.shape)
+            meta["original_numel"] = int(q.numel())
+            stats["int8_payload_bytes"] += len(packed) + tensor_nbytes(s)
+        else:
+            quantized[name] = q
+            stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+        if meta: qmeta[name] = meta
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
     obj: dict[str, object] = {
         "__quant_format__": "int8_clean_per_row_v1",
         "quantized": quantized, "scales": scales, "dtypes": dtypes, "passthrough": passthrough,
     }
+    if qmeta: obj["qmeta"] = qmeta
     if passthrough_orig_dtypes:
         obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
     return obj, stats
 
 def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
+    qmeta = obj.get("qmeta", {})
     passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
+        meta = qmeta.get(name, {})
+        if meta.get("packing") == "int6_4x3":
+            q = torch.from_numpy(unpack_int6(q.numpy(), meta["original_numel"]).reshape(meta["original_shape"]))
         if s.ndim > 0:
             s = s.to(dtype=torch.float32)
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
