@@ -42,7 +42,7 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 0))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -1264,6 +1264,9 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    ema_state = None
+    if args.ema_enabled:
+        ema_state = {k: v.detach().clone() for k, v in base_model.state_dict().items()}
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
@@ -1292,11 +1295,6 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    # MAIN TRAINING LOOP
-
-    ema_state = None
-    if args.ema_enabled:
-        ema_state = {k: v.detach().clone() for k, v in base_model.state_dict().items()}
     swa_state: dict[str, Tensor] = {}
     swa_count = 0
     training_time_ms = 0.0
