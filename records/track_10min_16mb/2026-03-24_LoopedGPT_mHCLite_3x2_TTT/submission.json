@@ -1,0 +1,24 @@
+{
+  "track": "10min_16mb",
+  "date": "2026-03-24",
+  "name": "LoopedGPT + mHC-lite (3x2 loops) + Single-Epoch TTT",
+  "author": "ctagard",
+  "val_bpb": null,
+  "val_bpb_std": null,
+  "val_bpb_per_seed": {
+    "1337": null,
+    "42": null,
+    "2024": null
+  },
+  "artifact_bytes_per_seed": {
+    "1337": null,
+    "42": null,
+    "2024": null
+  },
+  "seeds": [1337, 42, 2024],
+  "platform": "RunPod 8xH100 SXM",
+  "model_family": "LoopedGPT",
+  "architecture": "3 unique blocks x 2 loops, dim=768, mHC-lite 3-stream, SwiGLU MLP_MULT=2",
+  "quantization": "int6 bit-packed + zstd-22",
+  "ttt": "single-epoch backward-looking LoRA TTT, rank=8"
+}
