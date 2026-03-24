@@ -1372,7 +1372,7 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
-        if ema_state is not None and step % args.ema_every == 0:
+        if ema_state is not None and step > 0 and step % args.ema_every == 0:
             with torch.no_grad():
                 for k, v in base_model.state_dict().items():
                     ema_state[k].lerp_(v.to(ema_state[k].dtype), 1.0 - args.ema_decay ** args.ema_every)
