@@ -84,7 +84,7 @@ class Hyperparameters:
     lora_rank = int(os.environ.get("LORA_RANK", 24))
     lora_warmup_steps = int(os.environ.get("LORA_WARMUP_STEPS", 50))
     ortho_lora = bool(int(os.environ.get("ORTHO_LORA", "0")))
-    mhc_streams = int(os.environ.get("MHC_STREAMS", 3))
+    mhc_streams = int(os.environ.get("MHC_STREAMS", 4))
     mlp_type = os.environ.get("MLP_TYPE", "swiglu").strip().lower()
     wandb_project = os.environ.get("WANDB_PROJECT", "")
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
