@@ -1375,7 +1375,7 @@ def main() -> None:
         if ema_state is not None and step % args.ema_every == 0:
             with torch.no_grad():
                 for k, v in base_model.state_dict().items():
-                    ema_state[k].lerp_(v.float(), 1.0 - args.ema_decay)
+                    ema_state[k].lerp_(v.to(ema_state[k].dtype), 1.0 - args.ema_decay)
 
         if args.swa_enabled and scale < 1.0:
             with torch.no_grad():
