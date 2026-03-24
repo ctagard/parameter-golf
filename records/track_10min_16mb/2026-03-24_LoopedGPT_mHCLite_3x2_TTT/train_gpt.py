@@ -46,7 +46,7 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 700))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -667,7 +667,7 @@ def eval_val_ttt_lora(args, ttt_model, rank, world_size, device,
     byte_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     for ds, dl in short_docs:
-        chunk = all_tokens[ds:ds+dl]
+        chunk = all_tokens[ds:ds+dl].to(dtype=torch.int64)
         x, y = chunk[:-1].unsqueeze(0), chunk[1:].unsqueeze(0)
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             loss = ttt_model(x, y)
