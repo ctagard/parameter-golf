@@ -819,7 +819,6 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.register_buffer("depth_scale", torch.tensor(1.0 / math.sqrt(layer_idx + 1)))
 
     def forward(self, x: Tensor, x0: Tensor, q_delta=None, v_delta=None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -828,9 +827,8 @@ class Block(nn.Module):
         qd = q_delta(n) if callable(q_delta) else q_delta
         vd = v_delta(n) if callable(v_delta) else v_delta
         attn_out = self.attn(n, qd, vd)
-        ds = self.depth_scale.to(dtype=x.dtype)
-        x = x + ds * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + ds * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 class GPT(nn.Module):
     def __init__(
