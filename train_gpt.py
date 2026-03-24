@@ -810,7 +810,7 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 rope_base: float, qk_gain_init: float, mlp_type: str = "relu2", layer_idx: int = 0):
+                 rope_base: float, qk_gain_init: float, mlp_type: str = "relu2"):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -870,7 +870,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    mlp_type, layer_idx=i,
+                    mlp_type,
                 )
                 for i in range(num_layers)
             ]
@@ -947,8 +947,8 @@ class LoopedGPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mlp_type, layer_idx=bi)
-            for bi in range(num_unique_blocks)
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mlp_type)
+            for _ in range(num_unique_blocks)
         ])
         self.loop_emb = nn.Parameter(torch.zeros(num_loops, model_dim))
         self.final_norm = RMSNorm()
