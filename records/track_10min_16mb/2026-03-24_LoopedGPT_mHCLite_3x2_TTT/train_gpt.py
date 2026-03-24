@@ -95,7 +95,7 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.999))
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_every = int(os.environ.get("EMA_EVERY", 10))
-    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.01))
     ttt_chunk_size = int(os.environ.get("TTT_CHUNK_SIZE", 256))
