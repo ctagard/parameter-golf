@@ -91,7 +91,7 @@ class Hyperparameters:
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     muon_weight_decay = float(os.environ.get("MUON_WD", 0.04))
     adam_weight_decay = float(os.environ.get("ADAM_WD", 0.04))
-    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.999))
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_every = int(os.environ.get("EMA_EVERY", 10))
@@ -1375,7 +1375,7 @@ def main() -> None:
         if ema_state is not None and step % args.ema_every == 0:
             with torch.no_grad():
                 for k, v in base_model.state_dict().items():
-                    ema_state[k].lerp_(v.to(ema_state[k].dtype), 1.0 - args.ema_decay)
+                    ema_state[k].lerp_(v.to(ema_state[k].dtype), 1.0 - args.ema_decay ** args.ema_every)
 
         if args.swa_enabled and scale < 1.0:
             with torch.no_grad():
