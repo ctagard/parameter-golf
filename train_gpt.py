@@ -725,9 +725,12 @@ def eval_val_ttt_lora(args, ttt_model, rank, world_size, device,
                         prev = all_tokens[ds+ws+co:ds+ws+co+cl].cpu().numpy()
                         byte_sum += float(base_bytes_lut[tgt].sum() + (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).sum())
                 if needs_train:
-                    mask = torch.tensor([float(ci < num_chunks[b] - 1) for b in range(bsz)], device=device)
-                    per_doc = ptl[:, doc_info[0][0]:doc_info[0][0]+chunk_size].mean(dim=-1)
-                    cur_opt.zero_grad(); (per_doc * mask).sum().backward(); cur_opt.step()
+                    train_loss = torch.zeros(bsz, device=device)
+                    for b in range(bsz):
+                        if ci >= num_chunks[b] - 1: continue
+                        co, cl = doc_info[b]
+                        if cl > 0: train_loss[b] = ptl[b, co:co+cl].mean()
+                    cur_opt.zero_grad(); train_loss.sum().backward(); cur_opt.step()
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum); dist.all_reduce(byte_sum); dist.all_reduce(token_count)
     val_loss = float(loss_sum.item() / token_count.item())
@@ -806,16 +809,8 @@ class BigramHashEmbedding(nn.Module):
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
 class Block(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-        mlp_type: str = "relu2",
-    ):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_base: float, qk_gain_init: float, mlp_type: str = "relu2", layer_idx: int = 0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -824,6 +819,7 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.register_buffer("depth_scale", torch.tensor(1.0 / math.sqrt(layer_idx + 1)))
 
     def forward(self, x: Tensor, x0: Tensor, q_delta=None, v_delta=None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -832,8 +828,9 @@ class Block(nn.Module):
         qd = q_delta(n) if callable(q_delta) else q_delta
         vd = v_delta(n) if callable(v_delta) else v_delta
         attn_out = self.attn(n, qd, vd)
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        ds = self.depth_scale.to(dtype=x.dtype)
+        x = x + ds * self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        x = x + ds * self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 class GPT(nn.Module):
     def __init__(
@@ -875,7 +872,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    mlp_type,
+                    mlp_type, layer_idx=i,
                 )
                 for i in range(num_layers)
             ]
@@ -952,8 +949,8 @@ class LoopedGPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mlp_type)
-            for _ in range(num_unique_blocks)
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, mlp_type, layer_idx=bi)
+            for bi in range(num_unique_blocks)
         ])
         self.loop_emb = nn.Parameter(torch.zeros(num_loops, model_dim))
         self.final_norm = RMSNorm()
@@ -1291,6 +1288,8 @@ def main() -> None:
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
+        if ema_state is not None:
+            ema_state = {k: v.detach().clone() for k, v in base_model.state_dict().items()}
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -1380,7 +1379,7 @@ def main() -> None:
         if ema_state is not None and step % args.ema_every == 0:
             with torch.no_grad():
                 for k, v in base_model.state_dict().items():
-                    ema_state[k].lerp_(v, 1 - args.ema_decay)
+                    ema_state[k].lerp_(v.float(), 1.0 - args.ema_decay)
 
         if args.swa_enabled and scale < 1.0:
             with torch.no_grad():
