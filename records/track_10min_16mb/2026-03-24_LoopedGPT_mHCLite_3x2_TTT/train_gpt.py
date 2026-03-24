@@ -81,7 +81,7 @@ class Hyperparameters:
     model_family = os.environ.get("MODEL_FAMILY", "looped").strip().lower()
     num_unique_blocks = int(os.environ.get("NUM_UNIQUE_BLOCKS", 3))
     num_loops = int(os.environ.get("NUM_LOOPS", 2))
-    lora_rank = int(os.environ.get("LORA_RANK", 16))
+    lora_rank = int(os.environ.get("LORA_RANK", 24))
     lora_warmup_steps = int(os.environ.get("LORA_WARMUP_STEPS", 50))
     ortho_lora = bool(int(os.environ.get("ORTHO_LORA", "0")))
     mhc_streams = int(os.environ.get("MHC_STREAMS", 3))
